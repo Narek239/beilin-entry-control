@@ -71,7 +71,7 @@ public class BeilinEntryControl implements ModInitializer {
 	private void onServerStarting(MinecraftServer server) {
 		if (!server.isDedicatedServer()) return;
 		// apiKey 已在 onInitialize() 中检查，未配置时进程已退出
-		wsClient = new BeilinWsClient(config, server);
+		wsClient = new BeilinWsClient(config, server, apiClient);
 		wsClient.start();
 	}
 

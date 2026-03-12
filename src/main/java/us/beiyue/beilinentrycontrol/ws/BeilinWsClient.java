@@ -3,9 +3,12 @@ package us.beiyue.beilinentrycontrol.ws;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
 import us.beiyue.beilinentrycontrol.BeilinEntryControl;
 import us.beiyue.beilinentrycontrol.config.ModConfig;
 import us.beiyue.beilinentrycontrol.gate.EntryGate;
+import us.beiyue.beilinentrycontrol.http.BeilinApiClient;
+import us.beiyue.beilinentrycontrol.http.BeilinApiClient.JoinResult;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -18,6 +21,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -40,6 +44,7 @@ public final class BeilinWsClient {
 
 	private final ModConfig config;
 	private final MinecraftServer server;
+	private final BeilinApiClient apiClient;
 	private final ScheduledExecutorService scheduler;
 	private final AtomicReference<WebSocket> wsRef = new AtomicReference<>();
 	private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
@@ -51,10 +56,13 @@ public final class BeilinWsClient {
 	private volatile boolean intentionalClose;
 	private volatile long nextReconnectDelaySec = RECONNECT_INITIAL_SEC;
 	private int connectFailCount = 0;
+	/** True when last close was 1006; on next onWsUp we sync online players via player_join. */
+	private volatile boolean reconnectAfter1006 = false;
 
-	public BeilinWsClient(ModConfig config, MinecraftServer server) {
+	public BeilinWsClient(ModConfig config, MinecraftServer server, BeilinApiClient apiClient) {
 		this.config = config;
 		this.server = server;
+		this.apiClient = apiClient;
 		this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
 			Thread t = new Thread(r, "beilin-entry-control-ws");
 			t.setDaemon(true);
@@ -108,7 +116,7 @@ public final class BeilinWsClient {
 					if (connectFailCount <= 3 || connectFailCount % LOG_WARN_EVERY_N_FAILURES == 0) {
 						BeilinEntryControl.LOGGER.warn("Beilin WS connect failed (attempt {}): {}", connectFailCount, err.toString());
 					}
-					onWsDown();
+					onWsDown(true);
 					scheduleReconnect();
 				}
 			});
@@ -125,9 +133,11 @@ public final class BeilinWsClient {
 		}, delay, TimeUnit.SECONDS);
 	}
 
-	private void onWsDown() {
+	private void onWsDown(boolean kickPlayers) {
 		EntryGate.setAcceptingPlayers(false);
-		server.execute(() -> EntryGate.kickAll(server, EntryGate.SYNC_MESSAGE));
+		if (kickPlayers) {
+			server.execute(() -> EntryGate.kickAll(server, EntryGate.SYNC_MESSAGE));
+		}
 	}
 
 	private void onWsUp(WebSocket ws) {
@@ -137,6 +147,32 @@ public final class BeilinWsClient {
 		connectFailCount = 0;
 		EntryGate.setAcceptingPlayers(true);
 		startHeartbeat(ws);
+		if (reconnectAfter1006) {
+			reconnectAfter1006 = false;
+			syncOnlinePlayersAfterReconnect();
+		}
+	}
+
+	/**
+	 * After reconnect following 1006: session on server is cleared, so re-register all online
+	 * players via POST /player_join. Kick with "AccessRevoked" if ok is false.
+	 */
+	private void syncOnlinePlayersAfterReconnect() {
+		server.execute(() -> {
+			List<ServerPlayer> players = server.getPlayerList().getPlayers();
+			if (players.isEmpty()) return;
+			for (ServerPlayer p : players) {
+				String username = p.getGameProfile().getName();
+				if (username == null || username.isEmpty()) continue;
+				String u = username;
+				apiClient.playerJoinAsync(u)
+					.whenComplete((JoinResult r, Throwable ex) -> {
+						if (r != null && !r.ok) {
+							server.execute(() -> EntryGate.kickByUsername(server, u, "AccessRevoked"));
+						}
+					});
+			}
+		});
 	}
 
 	private void startHeartbeat(WebSocket ws) {
@@ -199,7 +235,11 @@ public final class BeilinWsClient {
 	private class Listener implements WebSocket.Listener {
 		@Override
 		public void onOpen(WebSocket webSocket) {
-			BeilinEntryControl.LOGGER.info("Beilin WS connected");
+			if (reconnectAfter1006) {
+				BeilinEntryControl.LOGGER.debug("Beilin WS connected (reconnect after 1006)");
+			} else {
+				BeilinEntryControl.LOGGER.info("Beilin WS connected");
+			}
 			onWsUp(webSocket);
 			webSocket.request(Long.MAX_VALUE);
 		}
@@ -242,20 +282,31 @@ public final class BeilinWsClient {
 		@Override
 		public void onError(WebSocket webSocket, Throwable error) {
 			BeilinEntryControl.LOGGER.warn("Beilin WS error: {}", error.toString());
-			wsRef.compareAndSet(webSocket, null);
+			boolean wasActive = wsRef.compareAndSet(webSocket, null);
 			cancelTimers();
-			onWsDown();
-			if (!intentionalClose) scheduleReconnect(); // guard prevents double schedule with onClose
+			onWsDown(true);
+			if (!intentionalClose && wasActive) scheduleReconnect();
 		}
 
 		@Override
 		public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-			BeilinEntryControl.LOGGER.info("Beilin WS closed {} {}", statusCode, reason);
-			wsRef.compareAndSet(webSocket, null);
+			// 1006: abnormal close; first reconnect after 1006 does not kick players, DEBUG log only.
+			boolean is1006 = (statusCode == 1006);
+			if (is1006) {
+				BeilinEntryControl.LOGGER.debug("Beilin WS closed 1006, reconnecting without kick");
+			} else {
+				BeilinEntryControl.LOGGER.info("Beilin WS closed {} {}", statusCode, reason);
+			}
+			boolean wasActive = wsRef.compareAndSet(webSocket, null);
 			cancelTimers();
 			if (!intentionalClose) {
-				onWsDown();
-				scheduleReconnect(); // reconnectScheduled ensures only one pending reconnect
+				if (is1006 && wasActive) {
+					reconnectAfter1006 = true;
+					onWsDown(false);
+				} else {
+					onWsDown(true);
+				}
+				if (wasActive) scheduleReconnect();
 			}
 			return null;
 		}
