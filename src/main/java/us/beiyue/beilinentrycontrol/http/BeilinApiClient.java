@@ -31,7 +31,8 @@ public final class BeilinApiClient {
 	}
 
 	/**
-	 * POST player_join — must respond with ok==true before player enters.
+	 * POST /server/{apiKey}/player_join — 200 + {@code allowed:true} 才允许进入；
+	 * 401 InvalidServerKey、400 Missing username 等见 {@link #parseJoinResponse}.
 	 */
 	public CompletableFuture<JoinResult> playerJoinAsync(String username) {
 		if (!config.isValid()) {
@@ -82,25 +83,51 @@ public final class BeilinApiClient {
 	}
 
 	private static JoinResult parseJoinResponse(int status, String body) {
-		if (status < 200 || status >= 300) {
-			return JoinResult.denied("HTTP " + status);
-		}
+		JsonObject o;
 		try {
-			JsonObject o = JsonParser.parseString(body).getAsJsonObject();
-			if (!o.has("ok")) {
-				return JoinResult.denied("响应无效");
-			}
-			boolean ok = o.get("ok").getAsBoolean();
-			if (ok) {
-				return JoinResult.allowed();
-			}
-			String rawReason = o.has("reason") && o.get("reason").isJsonPrimitive()
-				? o.get("reason").getAsString()
-				: "拒绝进入";
-			return JoinResult.denied(mapReason(rawReason));
+			o = (body != null && !body.isBlank())
+				? JsonParser.parseString(body).getAsJsonObject()
+				: new JsonObject();
 		} catch (Exception e) {
 			return JoinResult.denied("解析失败");
 		}
+		String error = jsonString(o, "error");
+
+		if (status == 401) {
+			if ("InvalidServerKey".equals(error)) {
+				return JoinResult.denied("服务器 API 密钥无效，请联系服主检查配置。");
+			}
+			return JoinResult.denied(error != null ? error : "HTTP 401");
+		}
+		if (status == 400) {
+			if ("Missing username".equals(error)) {
+				return JoinResult.denied("缺少用户名");
+			}
+			return JoinResult.denied(error != null ? error : "HTTP 400");
+		}
+		if (status < 200 || status >= 300) {
+			return JoinResult.denied(error != null ? error : ("HTTP " + status));
+		}
+
+		try {
+			if (!o.has("allowed")) {
+				return JoinResult.denied("响应无效");
+			}
+			if (!o.get("allowed").getAsBoolean()) {
+				String rawReason = jsonString(o, "reason");
+				return JoinResult.denied(mapReason(rawReason != null ? rawReason : "拒绝进入"));
+			}
+			return JoinResult.allowed();
+		} catch (Exception e) {
+			return JoinResult.denied("解析失败");
+		}
+	}
+
+	private static String jsonString(JsonObject o, String key) {
+		if (!o.has(key) || !o.get(key).isJsonPrimitive()) {
+			return null;
+		}
+		return o.get(key).getAsString();
 	}
 
 	private static String escapeJson(String s) {
@@ -113,16 +140,12 @@ public final class BeilinApiClient {
 			return "拒绝进入";
 		}
 		return switch (reason) {
-			case "BannedBySouth" ->
-				"您有一项来自 South Beilin 的禁令。该问题解决前，您无法进入服务器。";
-			case "BannedByNorth" ->
-				"您有一项来自 North Beilin 的禁令。该问题解决前，您无法进入服务器。";
-			case "BannedByBoth" ->
-				"您同时被 South Beilin 与 North Beilin 施加了禁令。该问题解决前，您无法进入服务器。";
 			case "NoApplication" ->
 				"您未注册 Beilin Entry Control。请在 beiyue.us 注册，并等待获批。";
-			case "NotApproved" ->
-				"您尚未获批北约入服权。请留意您的邮箱，并配合 South Beilin / North Beilin 进行额外审查（如有）。";
+			case "Banned" ->
+				"您受到来自北约成员服的一项/多项禁令。请登录 beiyue.us 查看详情。";
+			case "Restricted" ->
+				"您的北约入服权在该服务器受限。请登录 beiyue.us 查看详情。";
 			default -> reason;
 		};
 	}

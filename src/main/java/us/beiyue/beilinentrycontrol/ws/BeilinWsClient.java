@@ -155,7 +155,7 @@ public final class BeilinWsClient {
 
 	/**
 	 * After reconnect following 1006: session on server is cleared, so re-register all online
-	 * players via POST /player_join. Kick with "AccessRevoked" if ok is false.
+	 * players via POST /player_join. Kick with "AccessRevoked" if join is denied.
 	 */
 	private void syncOnlinePlayersAfterReconnect() {
 		server.execute(() -> {
