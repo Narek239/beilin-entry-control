@@ -1,0 +1,29 @@
+plugins {
+	id "java-library"
+	id "maven-publish"
+}
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+	withSourcesJar()
+}
+
+dependencies {
+	// keep common free of Minecraft/Fabric deps
+	api "com.google.code.gson:gson:2.10.1"
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 17
+}
+
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			artifactId = "${rootProject.findProperty("archives_base_name") ?: "beilin-entry-control"}-common"
+			from components.java
+		}
+	}
+}

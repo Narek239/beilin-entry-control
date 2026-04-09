@@ -1,0 +1,56 @@
+plugins {
+	id "net.fabricmc.fabric-loom-remap" version "${loom_version}"
+	id "maven-publish"
+}
+
+base {
+	archivesName = "${rootProject.findProperty("archives_base_name") ?: "beilin-entry-control"}-fabric-1.21.x"
+}
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(21)
+	}
+	withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 21
+}
+
+loom {
+	splitEnvironmentSourceSets()
+	mods {
+		"beilin-entry-control" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+dependencies {
+	// versions will be finalized when implementing adapters
+	minecraft "com.mojang:minecraft:${project.minecraft_121x_version}"
+	mappings loom.officialMojangMappings()
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_121x_version}"
+
+	implementation project(":common")
+	include project(":common")
+}
+
+processResources {
+	inputs.property "version", project.version
+	filesMatching("fabric.mod.json") {
+		expand "version": inputs.properties.version
+	}
+}
+
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			artifactId = "${rootProject.findProperty("archives_base_name") ?: "beilin-entry-control"}-fabric-1.21.x"
+			from components.java
+		}
+	}
+}

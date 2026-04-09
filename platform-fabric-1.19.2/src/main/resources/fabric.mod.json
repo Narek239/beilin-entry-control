@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "beilin-entry-control",
+  "version": "${version}",
+  "name": "Beilin Entry Control",
+  "description": "Server entry control via Beilin API/WS",
+  "authors": [
+    "Me!"
+  ],
+  "license": "CC0-1.0",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "us.beiyue.beilinentrycontrol.platform.fabric1192.BeilinEntryControl1192"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "~1.19.2",
+    "java": ">=17",
+    "fabric-api": "*"
+  }
+}
+
