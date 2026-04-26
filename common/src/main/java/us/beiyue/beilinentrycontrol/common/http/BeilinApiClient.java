@@ -145,6 +145,8 @@ public final class BeilinApiClient {
 				"您受到来自北约成员服的一项/多项禁令。请登录 beiyue.us 查看详情。";
 			case "Restricted" ->
 				"您的北约入服权在该服务器受限。请登录 beiyue.us 查看详情。";
+			case "EmailConfirmRequired" ->
+				"您正在尝试进入一个新的北约成员服，请查看邮件中的指引完成确认。";
 			default -> reason;
 		};
 	}
