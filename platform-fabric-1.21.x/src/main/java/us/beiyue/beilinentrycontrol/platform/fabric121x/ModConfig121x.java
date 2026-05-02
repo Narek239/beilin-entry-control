@@ -18,6 +18,8 @@ public final class ModConfig121x implements CommonConfig {
 
 	public String apiKey = "";
 	public String baseHost = "beiyue.us";
+	public String wsBackupDnsHost = "saas.wiki-beilin.org";
+	public long wsPrimaryProbeIntervalSec = 10;
 	public boolean useHttps = true;
 	public boolean useWss = true;
 
@@ -36,6 +38,16 @@ public final class ModConfig121x implements CommonConfig {
 	@Override
 	public boolean isApiKeyConfigured() {
 		return apiKey != null && !apiKey.isBlank() && !"YOUR_API_KEY_HERE".equals(apiKey.trim());
+	}
+
+	@Override
+	public String wsBackupDnsHost() {
+		return wsBackupDnsHost != null && !wsBackupDnsHost.isBlank() ? wsBackupDnsHost : "saas.wiki-beilin.org";
+	}
+
+	@Override
+	public long wsPrimaryProbeIntervalSec() {
+		return wsPrimaryProbeIntervalSec > 0 ? wsPrimaryProbeIntervalSec : 10;
 	}
 
 	@Override

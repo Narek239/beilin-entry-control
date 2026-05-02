@@ -11,6 +11,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import us.beiyue.beilinentrycontrol.common.gate.EntryGateState;
 import us.beiyue.beilinentrycontrol.common.http.BeilinApiClient;
+import us.beiyue.beilinentrycontrol.common.http.OutboundRouteState;
 import us.beiyue.beilinentrycontrol.common.ws.BeilinWsClient;
 
 public final class BeilinEntryControl121x implements ModInitializer {
@@ -18,6 +19,7 @@ public final class BeilinEntryControl121x implements ModInitializer {
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
 	private static ModConfig121x config;
+	private static OutboundRouteState outboundRouteState;
 	private static BeilinApiClient apiClient;
 	private static EntryGateState gateState;
 	private static BeilinWsClient wsClient;
@@ -38,7 +40,8 @@ public final class BeilinEntryControl121x implements ModInitializer {
 			System.exit(1);
 		}
 
-		apiClient = new BeilinApiClient(config);
+		outboundRouteState = new OutboundRouteState();
+		apiClient = new BeilinApiClient(config, outboundRouteState);
 		gateState = new EntryGateState();
 
 		LoginHandler121x.setApiClient(apiClient);
@@ -76,7 +79,8 @@ public final class BeilinEntryControl121x implements ModInitializer {
 			hooks,
 			apiClient,
 			gateState,
-			new Slf4jCommonLogger(LOGGER)
+			new Slf4jCommonLogger(LOGGER),
+			outboundRouteState
 		);
 		wsClient.start();
 	}
