@@ -221,7 +221,8 @@ public final class BeilinWsClient {
 			}
 		} catch (Exception e) {
 			log.warn("Beilin WS: cannot build URI ({}): {}", route, e.toString());
-			runOnScheduler(() -> onConnectFailed(e, route));
+			InetAddress backupIpUsed = resolvedBackupIp;
+			runOnScheduler(() -> onConnectFailed(e, route, backupIpUsed, closeMode));
 			return;
 		}
 
@@ -237,10 +238,19 @@ public final class BeilinWsClient {
 	}
 
 	private void onConnectFailed(Throwable err, OutboundRoute failedRoute) {
-		onConnectFailed(err, failedRoute, null);
+		onConnectFailed(err, failedRoute, null, SilentCloseMode.NORMAL);
 	}
 
 	private void onConnectFailed(Throwable err, OutboundRoute failedRoute, InetAddress backupIpTried) {
+		onConnectFailed(err, failedRoute, backupIpTried, SilentCloseMode.NORMAL);
+	}
+
+	private void onConnectFailed(
+		Throwable err,
+		OutboundRoute failedRoute,
+		InetAddress backupIpTried,
+		SilentCloseMode closeMode
+	) {
 		connectFailCount++;
 		boolean logDetail = connectFailCount <= 5 || connectFailCount % LOG_WARN_EVERY_N_FAILURES == 0;
 		if (logDetail) {
@@ -252,10 +262,39 @@ public final class BeilinWsClient {
 					connectFailCount, failedRoute, err != null ? err.toString() : "(null)");
 			}
 		}
+		if (handleSilentConnectFailed(closeMode)) {
+			return;
+		}
 		loud1006Disconnects = true;
 		pendingSilentCloseMode = SilentCloseMode.NORMAL;
 		onWsDown(true);
 		scheduleHandshakeFailureReconnect(failedRoute);
+	}
+
+	/**
+	 * Extends the 1006 silent chain across handshake failures:
+	 * PRIMARY retry failure -> BACKUP try; BACKUP retry failure -> PRIMARY try; chain exhaustion -> loud mode.
+	 */
+	private boolean handleSilentConnectFailed(SilentCloseMode closeMode) {
+		switch (closeMode) {
+			case SILENT_PRIMARY_RETRY:
+				routeState.setOutboundRoute(OutboundRoute.BACKUP);
+				pendingSilentCloseMode = SilentCloseMode.SILENT_BACKUP_TRY;
+				onWsDown(false);
+				connectImmediateRun();
+				return true;
+			case SILENT_BACKUP_RETRY:
+				routeState.setOutboundRoute(OutboundRoute.PRIMARY);
+				pendingSilentCloseMode = SilentCloseMode.SILENT_PRIMARY_AFTER_BACKUP;
+				onWsDown(false);
+				connectImmediateRun();
+				return true;
+			case SILENT_BACKUP_TRY:
+			case SILENT_PRIMARY_AFTER_BACKUP:
+			case NORMAL:
+			default:
+				return false;
+		}
 	}
 
 	/**
@@ -465,15 +504,16 @@ public final class BeilinWsClient {
 				routeState.setOutboundRoute(OutboundRoute.PRIMARY);
 				loudAltOrdinal = 0;
 				cancelPrimaryProbe();
-				WebSocket w = wsRef.get();
+				WebSocket w = wsRef.getAndSet(null);
 				if (w != null) {
+					cancelTimers();
+					onWsDown(false);
 					try {
 						w.close(NORMAL_CLOSURE, "switch_to_primary");
 					} catch (Exception ignored) {
 					}
-				} else {
-					connectImmediateRun();
 				}
+				connectImmediateRun();
 			}
 		} catch (Exception e) {
 			log.debug("Beilin WS PRIMARY probe failed: {}", e.toString());
@@ -565,10 +605,10 @@ public final class BeilinWsClient {
 			log.info("Beilin WS closed {} {}", statusCode, reason);
 		}
 		boolean wasActive = wsRef.compareAndSet(webSocket, null);
-		cancelTimers();
 		if (intentionalClose || !wasActive) {
 			return;
 		}
+		cancelTimers();
 
 		if (statusCode == NORMAL_CLOSURE && "switch_to_primary".equals(reason)) {
 			onWsDown(false);
@@ -579,40 +619,42 @@ public final class BeilinWsClient {
 		boolean kickOnThisDown = loud1006Disconnects || !is1006;
 		boolean handled = false;
 
-		switch (closeMode) {
-			case SILENT_PRIMARY_RETRY:
-				routeState.setOutboundRoute(OutboundRoute.BACKUP);
-				pendingSilentCloseMode = SilentCloseMode.SILENT_BACKUP_TRY;
-				onWsDown(false);
-				connectImmediateRun();
-				handled = true;
-				break;
-			case SILENT_BACKUP_TRY:
-				loud1006Disconnects = true;
-				pendingSilentCloseMode = SilentCloseMode.NORMAL;
-				loudAltOrdinal = 0;
-				onWsDown(true);
-				scheduleReconnect();
-				handled = true;
-				break;
-			case SILENT_BACKUP_RETRY:
-				routeState.setOutboundRoute(OutboundRoute.PRIMARY);
-				pendingSilentCloseMode = SilentCloseMode.SILENT_PRIMARY_AFTER_BACKUP;
-				onWsDown(false);
-				connectImmediateRun();
-				handled = true;
-				break;
-			case SILENT_PRIMARY_AFTER_BACKUP:
-				loud1006Disconnects = true;
-				pendingSilentCloseMode = SilentCloseMode.NORMAL;
-				loudAltOrdinal = 0;
-				onWsDown(true);
-				scheduleReconnect();
-				handled = true;
-				break;
-			case NORMAL:
-			default:
-				break;
+		if (is1006) {
+			switch (closeMode) {
+				case SILENT_PRIMARY_RETRY:
+					routeState.setOutboundRoute(OutboundRoute.BACKUP);
+					pendingSilentCloseMode = SilentCloseMode.SILENT_BACKUP_TRY;
+					onWsDown(false);
+					connectImmediateRun();
+					handled = true;
+					break;
+				case SILENT_BACKUP_TRY:
+					loud1006Disconnects = true;
+					pendingSilentCloseMode = SilentCloseMode.NORMAL;
+					loudAltOrdinal = 0;
+					onWsDown(true);
+					scheduleReconnect();
+					handled = true;
+					break;
+				case SILENT_BACKUP_RETRY:
+					routeState.setOutboundRoute(OutboundRoute.PRIMARY);
+					pendingSilentCloseMode = SilentCloseMode.SILENT_PRIMARY_AFTER_BACKUP;
+					onWsDown(false);
+					connectImmediateRun();
+					handled = true;
+					break;
+				case SILENT_PRIMARY_AFTER_BACKUP:
+					loud1006Disconnects = true;
+					pendingSilentCloseMode = SilentCloseMode.NORMAL;
+					loudAltOrdinal = 0;
+					onWsDown(true);
+					scheduleReconnect();
+					handled = true;
+					break;
+				case NORMAL:
+				default:
+					break;
+			}
 		}
 
 		if (!handled) {
@@ -640,19 +682,24 @@ public final class BeilinWsClient {
 		Throwable error,
 		OutboundRoute connectRoute,
 		SilentCloseMode closeMode,
-		InetAddress backupIpTried
+		InetAddress backupIpTried,
+		boolean opened
 	) {
 		if (wsRef.get() == webSocket) {
 			handleClose(webSocket, 1006, error != null ? error.toString() : "", connectRoute, closeMode);
 			return;
 		}
-		onConnectFailed(error, connectRoute, backupIpTried);
+		if (opened) {
+			return;
+		}
+		onConnectFailed(error, connectRoute, backupIpTried, closeMode);
 	}
 
 	private final class Listener extends WebSocketListener {
 		private final OutboundRoute connectRoute;
 		private final SilentCloseMode closeMode;
 		private final InetAddress backupIpTried;
+		private volatile boolean opened;
 
 		Listener(OutboundRoute connectRoute, SilentCloseMode closeMode, InetAddress backupIpTried) {
 			this.connectRoute = connectRoute;
@@ -662,6 +709,7 @@ public final class BeilinWsClient {
 
 		@Override
 		public void onOpen(WebSocket webSocket, Response response) {
+			opened = true;
 			runOnScheduler(() -> handleOpen(webSocket, connectRoute, closeMode));
 		}
 
@@ -687,7 +735,8 @@ public final class BeilinWsClient {
 
 		@Override
 		public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-			runOnScheduler(() -> handleFailure(webSocket, t, connectRoute, closeMode, backupIpTried));
+			boolean wasOpened = opened;
+			runOnScheduler(() -> handleFailure(webSocket, t, connectRoute, closeMode, backupIpTried, wasOpened));
 		}
 	}
 }
