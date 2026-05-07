@@ -2,18 +2,23 @@ package us.beiyue.beilinentrycontrol.common.http;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 import us.beiyue.beilinentrycontrol.common.config.CommonConfig;
 
-import javax.net.ssl.SNIHostName;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLParameters;
+import java.io.IOException;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.UnknownHostException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -24,40 +29,19 @@ import java.util.concurrent.CompletableFuture;
 
 /**
  * Async HTTP to Beilin Worker API. Network error or non-allowed => deny.
- * When {@link OutboundRouteState} is BACKUP (same as WebSocket egress), HTTPS uses literal backup IP + {@code Host}.
+ * When {@link OutboundRouteState} is BACKUP, OkHttp keeps the logical URL host and routes DNS to the selected backup IP.
  */
 public final class BeilinApiClient {
-
-	/**
-	 * BACKUP literal-IP HTTPS needs {@code Host}; must run before the first {@link HttpClient} in the JVM.
-	 */
-	static {
-		String key = "jdk.httpclient.allowRestrictedHeaders";
-		String cur = System.getProperty(key, "").trim();
-		if (cur.isEmpty()) {
-			System.setProperty(key, "host");
-		} else {
-			boolean hasHost = false;
-			for (String part : cur.split(",")) {
-				if ("host".equalsIgnoreCase(part.trim())) {
-					hasHost = true;
-					break;
-				}
-			}
-			if (!hasHost) {
-				System.setProperty(key, cur + ",host");
-			}
-		}
-	}
 
 	private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
 	private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(15);
 	private static final int BACKUP_INET_MAX_PER_DNS = 1;
+	private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
 	private final HttpClient primaryHttpClient = HttpClient.newBuilder()
 		.connectTimeout(CONNECT_TIMEOUT)
 		.build();
-	private final HttpClient backupHttpClient;
+	private final OkHttpClient backupHttpClient;
 
 	private final CommonConfig config;
 	private final OutboundRouteState outboundRouteState;
@@ -65,17 +49,11 @@ public final class BeilinApiClient {
 	public BeilinApiClient(CommonConfig config, OutboundRouteState outboundRouteState) {
 		this.config = Objects.requireNonNull(config, "config");
 		this.outboundRouteState = Objects.requireNonNull(outboundRouteState, "outboundRouteState");
-		try {
-			SSLParameters sslParameters = SSLContext.getDefault().getDefaultSSLParameters();
-			sslParameters.setServerNames(List.of(new SNIHostName(config.baseHost())));
-			sslParameters.setEndpointIdentificationAlgorithm("HTTPS");
-			this.backupHttpClient = HttpClient.newBuilder()
-				.sslParameters(sslParameters)
-				.connectTimeout(CONNECT_TIMEOUT)
-				.build();
-		} catch (Exception e) {
-			throw new IllegalStateException("Beilin API: cannot init backup HttpClient SSL", e);
-		}
+		this.backupHttpClient = new OkHttpClient.Builder()
+			.connectTimeout(CONNECT_TIMEOUT)
+			.callTimeout(REQUEST_TIMEOUT)
+			.dns(new FixedHostDns(config.baseHost(), this::resolveStickyOrFreshBackupInet))
+			.build();
 	}
 
 	/**
@@ -88,7 +66,7 @@ public final class BeilinApiClient {
 		}
 		String json = "{\"username\":\"" + escapeJson(username) + "\"}";
 		return postJson("/player_join", json)
-			.thenApply(r -> parseJoinResponse(r.statusCode(), r.body()))
+			.thenApply(r -> parseJoinResponse(r.statusCode, r.body))
 			.exceptionally(ex -> JoinResult.denied("网络异常"));
 	}
 
@@ -97,11 +75,11 @@ public final class BeilinApiClient {
 	 */
 	public CompletableFuture<Boolean> playerLeaveAsync(String username) {
 		return postJson("/player_leave", "{\"username\":\"" + escapeJson(username) + "\"}")
-			.thenApply(r -> r.statusCode() >= 200 && r.statusCode() < 300)
+			.thenApply(r -> r.statusCode >= 200 && r.statusCode < 300)
 			.exceptionally(ex -> false);
 	}
 
-	private CompletableFuture<HttpResponse<String>> postJson(String pathSuffix, String jsonBody) {
+	private CompletableFuture<ApiResponse> postJson(String pathSuffix, String jsonBody) {
 		if (!config.isValid()) {
 			return CompletableFuture.failedFuture(new IllegalStateException("config invalid"));
 		}
@@ -117,14 +95,7 @@ public final class BeilinApiClient {
 				port = "https".equalsIgnoreCase(logicalBase.getScheme()) ? 443 : 80;
 			}
 
-			HttpClient client;
-			HttpRequest.Builder rb = HttpRequest.newBuilder()
-				.timeout(REQUEST_TIMEOUT)
-				.header("Content-Type", "application/json")
-				.POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8));
-
 			if (route == OutboundRoute.PRIMARY) {
-				client = primaryHttpClient;
 				URI uri = new URI(
 					logicalBase.getScheme(),
 					null,
@@ -134,37 +105,54 @@ public final class BeilinApiClient {
 					logicalBase.getRawQuery(),
 					null
 				);
-				rb.uri(uri);
-			} else {
-				client = backupHttpClient;
-				InetAddress inet = outboundRouteState.getStickyBackupInet();
-				if (inet == null) {
-					inet = resolveBackupInetFresh();
-				}
-				String hostLit = InetAddressFormatting.hostLiteral(inet);
-				URI uri = new URI(logicalBase.getScheme(), null, hostLit, port, fullPath, logicalBase.getRawQuery(), null);
-				rb.uri(uri);
-				rb.header("Host", hostHeaderForAuthority(config.baseHost(), port, logicalBase.getScheme()));
-				/*
-				 * JDK negotiates HTTP/2 by default; :authority follows the literal IP from the URI while SNI/Host use
-				 * the logical hostname — CDNs respond with HTTP 421 (Misdirected Request). WS uses HTTP/1.1 Upgrade;
-				 * keep REST literal-IP on HTTP/1.1 as well.
-				 */
-				rb.version(HttpClient.Version.HTTP_1_1);
+				HttpRequest request = HttpRequest.newBuilder()
+					.timeout(REQUEST_TIMEOUT)
+					.header("Content-Type", "application/json")
+					.POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+					.uri(uri)
+					.build();
+				return primaryHttpClient.sendAsync(request, java.net.http.HttpResponse.BodyHandlers.ofString())
+					.thenApply(r -> new ApiResponse(r.statusCode(), r.body()));
 			}
 
-			return client.sendAsync(rb.build(), HttpResponse.BodyHandlers.ofString());
+			URI uri = new URI(
+				logicalBase.getScheme(),
+				null,
+				logicalBase.getHost(),
+				port,
+				fullPath,
+				logicalBase.getRawQuery(),
+				null
+			);
+			return postJsonBackup(uri, jsonBody);
 		} catch (Exception e) {
 			return CompletableFuture.failedFuture(e);
 		}
 	}
 
-	/** Join {@code httpBase()} path ({@code /server/{key}}) with suffix ({@code /player_join}). */
-	private static String hostHeaderForAuthority(String host, int port, String scheme) {
-		boolean implicitPort =
-			("https".equalsIgnoreCase(scheme) && port == 443)
-				|| ("http".equalsIgnoreCase(scheme) && port == 80);
-		return implicitPort ? host : host + ":" + port;
+	private CompletableFuture<ApiResponse> postJsonBackup(URI uri, String jsonBody) {
+		CompletableFuture<ApiResponse> future = new CompletableFuture<>();
+		Request request = new Request.Builder()
+			.url(uri.toASCIIString())
+			.post(RequestBody.create(JSON, jsonBody))
+			.build();
+		backupHttpClient.newCall(request).enqueue(new Callback() {
+			@Override
+			public void onFailure(Call call, IOException e) {
+				future.completeExceptionally(e);
+			}
+
+			@Override
+			public void onResponse(Call call, Response response) {
+				try (Response r = response) {
+					ResponseBody body = r.body();
+					future.complete(new ApiResponse(r.code(), body != null ? body.string() : ""));
+				} catch (IOException e) {
+					future.completeExceptionally(e);
+				}
+			}
+		});
+		return future;
 	}
 
 	private static String concatHttpPaths(String baseRawPath, String pathSuffix) {
@@ -174,6 +162,11 @@ public final class BeilinApiClient {
 			return base + suffix.substring(1);
 		}
 		return base + suffix;
+	}
+
+	private InetAddress resolveStickyOrFreshBackupInet() throws UnknownHostException {
+		InetAddress inet = outboundRouteState.getStickyBackupInet();
+		return inet != null ? inet : resolveBackupInetFresh();
 	}
 
 	private InetAddress resolveBackupInetFresh() throws UnknownHostException {
@@ -268,6 +261,16 @@ public final class BeilinApiClient {
 				"您正在尝试进入一个新的北约成员服，请查看邮件中的指引完成确认。";
 			default -> reason;
 		};
+	}
+
+	private static final class ApiResponse {
+		final int statusCode;
+		final String body;
+
+		ApiResponse(int statusCode, String body) {
+			this.statusCode = statusCode;
+			this.body = body != null ? body : "";
+		}
 	}
 
 	public static final class JoinResult {

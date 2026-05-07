@@ -37,6 +37,9 @@ dependencies {
 
 	implementation project(":common")
 	include project(":common")
+	include "com.squareup.okhttp3:okhttp:${project.okhttp_version}"
+	include "com.squareup.okio:okio-jvm:${project.okio_version}"
+	include "org.jetbrains.kotlin:kotlin-stdlib:${project.kotlin_version}"
 }
 
 processResources {

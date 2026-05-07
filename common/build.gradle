@@ -13,6 +13,7 @@ java {
 dependencies {
 	// keep common free of Minecraft/Fabric deps
 	api "com.google.code.gson:gson:2.10.1"
+	api "com.squareup.okhttp3:okhttp:${rootProject.findProperty("okhttp_version")}"
 }
 
 tasks.withType(JavaCompile).configureEach {

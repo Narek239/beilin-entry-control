@@ -2,15 +2,21 @@ package us.beiyue.beilinentrycontrol.common.ws;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+import okio.ByteString;
 import us.beiyue.beilinentrycontrol.common.config.CommonConfig;
 import us.beiyue.beilinentrycontrol.common.gate.EntryGateState;
 import us.beiyue.beilinentrycontrol.common.http.BeilinApiClient;
 import us.beiyue.beilinentrycontrol.common.http.BeilinApiClient.JoinResult;
+import us.beiyue.beilinentrycontrol.common.http.FixedHostDns;
 import us.beiyue.beilinentrycontrol.common.log.CommonLogger;
 import us.beiyue.beilinentrycontrol.common.platform.PlatformHooks;
 
 import javax.net.ssl.SNIHostName;
-import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
@@ -21,15 +27,10 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URI;
 import java.net.UnknownHostException;
-import java.net.http.HttpClient;
-import java.net.http.WebSocket;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -49,6 +50,7 @@ import us.beiyue.beilinentrycontrol.common.http.OutboundRouteState;
  * Each successful WS session triggers {@link BeilinApiClient#playerJoinAsync} for all in-world players (auth clears online state on new connections).
  */
 public final class BeilinWsClient {
+	private static final int NORMAL_CLOSURE = 1000;
 	private static final long PING_INTERVAL_SEC = 15;
 	private static final long PONG_TIMEOUT_SEC = 30;
 	private static final long RECONNECT_INITIAL_SEC = 5;
@@ -61,7 +63,7 @@ public final class BeilinWsClient {
 	private static final int PRIMARY_PROBE_CONNECT_MS = 5_000;
 
 	/**
-	 * How the next {@link Listener#onClose} for <em>this</em> WebSocket should be interpreted for 1006 silent logic.
+	 * How the next close/failure for <em>this</em> WebSocket should be interpreted for 1006 silent logic.
 	 */
 	private enum SilentCloseMode {
 		NORMAL,
@@ -75,11 +77,12 @@ public final class BeilinWsClient {
 		SILENT_PRIMARY_AFTER_BACKUP
 	}
 
-	/** {@link BeilinApiClient} static init sets {@code jdk.httpclient.allowRestrictedHeaders=host} before first {@link HttpClient}. */
-	private final HttpClient primaryHttpClient = HttpClient.newBuilder()
+	private final OkHttpClient primaryWsClient = new OkHttpClient.Builder()
 		.connectTimeout(Duration.ofSeconds(10))
 		.build();
-	private final HttpClient backupHttpClient;
+	private final OkHttpClient backupWsClient = new OkHttpClient.Builder()
+		.connectTimeout(Duration.ofSeconds(10))
+		.build();
 
 	private final CommonConfig config;
 	private final PlatformHooks hooks;
@@ -113,9 +116,6 @@ public final class BeilinWsClient {
 	private long backupInetCacheExpiryMs;
 	private int backupInetCursor;
 
-	/** Last outbound route attempted in {@link #connectAsync} (scheduler thread). */
-	private OutboundRoute lastConnectRouteAttempted = OutboundRoute.PRIMARY;
-
 	public BeilinWsClient(
 		CommonConfig config,
 		PlatformHooks hooks,
@@ -135,17 +135,6 @@ public final class BeilinWsClient {
 			t.setDaemon(true);
 			return t;
 		});
-		try {
-			SSLParameters sslParameters = SSLContext.getDefault().getDefaultSSLParameters();
-			sslParameters.setServerNames(List.of(new SNIHostName(config.baseHost())));
-			sslParameters.setEndpointIdentificationAlgorithm("HTTPS");
-			this.backupHttpClient = HttpClient.newBuilder()
-				.sslParameters(sslParameters)
-				.connectTimeout(Duration.ofSeconds(10))
-				.build();
-		} catch (Exception e) {
-			throw new IllegalStateException("Beilin WS: cannot init backup HttpClient SSL", e);
-		}
 	}
 
 	public void start() {
@@ -170,9 +159,9 @@ public final class BeilinWsClient {
 		cancelTimers();
 		cancelPrimaryProbe();
 		WebSocket w = wsRef.getAndSet(null);
-		if (w != null && !w.isOutputClosed()) {
+		if (w != null) {
 			try {
-				w.sendClose(WebSocket.NORMAL_CLOSURE, "shutdown");
+				w.close(NORMAL_CLOSURE, "shutdown");
 			} catch (Exception ignored) {
 			}
 		}
@@ -190,9 +179,9 @@ public final class BeilinWsClient {
 			return;
 		}
 		WebSocket prev = wsRef.getAndSet(null);
-		if (prev != null && !prev.isOutputClosed()) {
+		if (prev != null) {
 			try {
-				prev.sendClose(WebSocket.NORMAL_CLOSURE, "reconnect");
+				prev.close(NORMAL_CLOSURE, "reconnect");
 			} catch (Exception ignored) {
 			}
 		}
@@ -205,24 +194,30 @@ public final class BeilinWsClient {
 		} else {
 			route = resolveConnectRoute();
 		}
-		lastConnectRouteAttempted = route;
 
 		SilentCloseMode closeMode = pendingSilentCloseMode;
 		pendingSilentCloseMode = SilentCloseMode.NORMAL;
 
-		URI uri;
-		HttpClient client;
+		Request request;
+		OkHttpClient client;
 		InetAddress resolvedBackupIp = null;
 		try {
 			if (route == OutboundRoute.PRIMARY) {
 				routeState.clearStickyBackupInet();
-				uri = URI.create(config.wsUri());
-				client = primaryHttpClient;
+				request = new Request.Builder()
+					.url(URI.create(config.wsUri()).toASCIIString())
+					.build();
+				client = primaryWsClient;
 			} else {
 				resolvedBackupIp = resolveBackupAddress();
 				routeState.setStickyBackupInet(resolvedBackupIp);
-				uri = backupWsUri(resolvedBackupIp);
-				client = backupHttpClient;
+				InetAddress backupIpForDns = resolvedBackupIp;
+				request = new Request.Builder()
+					.url(URI.create(config.wsUri()).toASCIIString())
+					.build();
+				client = backupWsClient.newBuilder()
+					.dns(new FixedHostDns(config.baseHost(), () -> backupIpForDns))
+					.build();
 			}
 		} catch (Exception e) {
 			log.warn("Beilin WS: cannot build URI ({}): {}", route, e.toString());
@@ -230,24 +225,9 @@ public final class BeilinWsClient {
 			return;
 		}
 
-		WebSocket.Builder builder = client.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(15));
-		if (route == OutboundRoute.BACKUP) {
-			URI logical = URI.create(config.wsUri());
-			int port = logical.getPort();
-			if (port < 0) {
-				port = "wss".equalsIgnoreCase(logical.getScheme()) ? 443 : 80;
-			}
-			builder.header("Host", config.baseHost() + ":" + port);
-		}
-
 		final OutboundRoute connectRoute = route;
 		final InetAddress backupIpUsed = resolvedBackupIp;
-		builder.buildAsync(uri, new Listener(connectRoute, closeMode))
-			.whenComplete((ws, err) -> {
-				if (err != null) {
-					runOnScheduler(() -> onConnectFailed(err, connectRoute, backupIpUsed));
-				}
-			});
+		client.newWebSocket(request, new Listener(connectRoute, closeMode, backupIpUsed));
 	}
 
 	private void connectImmediateRun() {
@@ -261,7 +241,6 @@ public final class BeilinWsClient {
 	}
 
 	private void onConnectFailed(Throwable err, OutboundRoute failedRoute, InetAddress backupIpTried) {
-		lastConnectRouteAttempted = failedRoute;
 		connectFailCount++;
 		boolean logDetail = connectFailCount <= 5 || connectFailCount % LOG_WARN_EVERY_N_FAILURES == 0;
 		if (logDetail) {
@@ -379,24 +358,6 @@ public final class BeilinWsClient {
 		return v4.toArray(new InetAddress[0]);
 	}
 
-	private URI backupWsUri(InetAddress addr) throws Exception {
-		URI logical = URI.create(config.wsUri());
-		String scheme = logical.getScheme();
-		int port = logical.getPort();
-		if (port < 0) {
-			port = "wss".equalsIgnoreCase(scheme) ? 443 : 80;
-		}
-		String path = logical.getRawPath();
-		if (path == null || path.isEmpty()) {
-			path = "/";
-		}
-		String q = logical.getRawQuery();
-		if (q != null && !q.isEmpty()) {
-			path = path + "?" + q;
-		}
-		return new URI(scheme, null, InetAddressFormatting.hostLiteral(addr), port, path, null, null);
-	}
-
 	private void scheduleReconnect() {
 		if (intentionalClose) return;
 		if (!reconnectScheduled.compareAndSet(false, true)) return;
@@ -454,14 +415,16 @@ public final class BeilinWsClient {
 	private void startHeartbeat(WebSocket ws) {
 		cancelTimers();
 		pingTask = scheduler.scheduleAtFixedRate(() -> {
-			if (ws.isOutputClosed()) return;
 			try {
-				ws.sendText("{\"action\":\"ping\"}", true);
+				if (!ws.send("{\"action\":\"ping\"}")) {
+					log.warn("Beilin WS ping send failed: output queue closed");
+					return;
+				}
 				if (pongWatchdog != null) pongWatchdog.cancel(false);
 				pongWatchdog = scheduler.schedule(() -> {
 					if (System.currentTimeMillis() - lastPongTime > PONG_TIMEOUT_SEC * 1000L) {
 						log.warn("Beilin WS pong timeout, aborting");
-						ws.abort();
+						ws.cancel();
 					}
 				}, PONG_TIMEOUT_SEC, TimeUnit.SECONDS);
 			} catch (Exception e) {
@@ -503,9 +466,9 @@ public final class BeilinWsClient {
 				loudAltOrdinal = 0;
 				cancelPrimaryProbe();
 				WebSocket w = wsRef.get();
-				if (w != null && !w.isOutputClosed()) {
+				if (w != null) {
 					try {
-						w.sendClose(WebSocket.NORMAL_CLOSURE, "switch_to_primary");
+						w.close(NORMAL_CLOSURE, "switch_to_primary");
 					} catch (Exception ignored) {
 					}
 				} else {
@@ -592,7 +555,6 @@ public final class BeilinWsClient {
 		} else {
 			cancelPrimaryProbe();
 		}
-		webSocket.request(Long.MAX_VALUE);
 	}
 
 	private void handleClose(WebSocket webSocket, int statusCode, String reason, OutboundRoute connectRoute, SilentCloseMode closeMode) {
@@ -608,7 +570,7 @@ public final class BeilinWsClient {
 			return;
 		}
 
-		if (statusCode == WebSocket.NORMAL_CLOSURE && "switch_to_primary".equals(reason)) {
+		if (statusCode == NORMAL_CLOSURE && "switch_to_primary".equals(reason)) {
 			onWsDown(false);
 			connectImmediateRun();
 			return;
@@ -673,75 +635,59 @@ public final class BeilinWsClient {
 		}
 	}
 
-	private void handleError(WebSocket webSocket, Throwable error) {
-		log.warn("Beilin WS error: {}", error.toString());
-		boolean wasActive = wsRef.compareAndSet(webSocket, null);
-		cancelTimers();
-		if (!intentionalClose && wasActive) {
-			loud1006Disconnects = true;
-			pendingSilentCloseMode = SilentCloseMode.NORMAL;
-			onWsDown(true);
-			scheduleReconnect();
+	private void handleFailure(
+		WebSocket webSocket,
+		Throwable error,
+		OutboundRoute connectRoute,
+		SilentCloseMode closeMode,
+		InetAddress backupIpTried
+	) {
+		if (wsRef.get() == webSocket) {
+			handleClose(webSocket, 1006, error != null ? error.toString() : "", connectRoute, closeMode);
+			return;
 		}
+		onConnectFailed(error, connectRoute, backupIpTried);
 	}
 
-	private final class Listener implements WebSocket.Listener {
+	private final class Listener extends WebSocketListener {
 		private final OutboundRoute connectRoute;
 		private final SilentCloseMode closeMode;
-		private final StringBuilder textBuffer = new StringBuilder();
+		private final InetAddress backupIpTried;
 
-		Listener(OutboundRoute connectRoute, SilentCloseMode closeMode) {
+		Listener(OutboundRoute connectRoute, SilentCloseMode closeMode, InetAddress backupIpTried) {
 			this.connectRoute = connectRoute;
 			this.closeMode = closeMode;
+			this.backupIpTried = backupIpTried;
 		}
 
 		@Override
-		public void onOpen(WebSocket webSocket) {
+		public void onOpen(WebSocket webSocket, Response response) {
 			runOnScheduler(() -> handleOpen(webSocket, connectRoute, closeMode));
 		}
 
 		@Override
-		public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-			textBuffer.append(data);
-			if (last) {
-				String full = textBuffer.toString();
-				textBuffer.setLength(0);
-				runOnScheduler(() -> handleTextMessage(full));
-			}
-			webSocket.request(1);
-			return null;
+		public void onMessage(WebSocket webSocket, String text) {
+			runOnScheduler(() -> handleTextMessage(text));
 		}
 
 		@Override
-		public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
-			byte[] bytes = new byte[data.remaining()];
-			data.get(bytes);
-			textBuffer.append(new String(bytes, StandardCharsets.UTF_8));
-			if (last) {
-				String full = textBuffer.toString();
-				textBuffer.setLength(0);
-				runOnScheduler(() -> handleTextMessage(full));
-			}
-			webSocket.request(1);
-			return null;
+		public void onMessage(WebSocket webSocket, ByteString bytes) {
+			runOnScheduler(() -> handleTextMessage(bytes.utf8()));
 		}
 
 		@Override
-		public CompletionStage<?> onPong(WebSocket webSocket, ByteBuffer message) {
-			lastPongTime = System.currentTimeMillis();
-			webSocket.request(1);
-			return null;
+		public void onClosing(WebSocket webSocket, int code, String reason) {
+			webSocket.close(code, reason);
 		}
 
 		@Override
-		public void onError(WebSocket webSocket, Throwable error) {
-			runOnScheduler(() -> handleError(webSocket, error));
+		public void onClosed(WebSocket webSocket, int code, String reason) {
+			runOnScheduler(() -> handleClose(webSocket, code, reason, connectRoute, closeMode));
 		}
 
 		@Override
-		public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-			runOnScheduler(() -> handleClose(webSocket, statusCode, reason, connectRoute, closeMode));
-			return null;
+		public void onFailure(WebSocket webSocket, Throwable t, Response response) {
+			runOnScheduler(() -> handleFailure(webSocket, t, connectRoute, closeMode, backupIpTried));
 		}
 	}
 }
