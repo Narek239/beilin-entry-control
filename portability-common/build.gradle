@@ -1,0 +1,64 @@
+plugins {
+	id "java-library"
+	id "maven-publish"
+}
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+	withSourcesJar()
+}
+
+dependencies {
+	api project(":common")
+	testRuntimeOnly "org.xerial:sqlite-jdbc:${project.sqlite_jdbc_version}"
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 17
+}
+
+tasks.named("test", Test) {
+	failOnNoDiscoveredTests = false
+}
+
+tasks.register("uploadFlowTest", JavaExec) {
+	dependsOn tasks.named("testClasses")
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = "us.beiyue.beilinentryportability.common.PortabilityApiClientUploadFlowTest"
+}
+
+tasks.register("storageTest", JavaExec) {
+	dependsOn tasks.named("testClasses")
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = "us.beiyue.beilinentryportability.common.BuildingIndexStoreStorageTest"
+}
+
+tasks.register("litematicRoundTripTest", JavaExec) {
+	dependsOn tasks.named("testClasses")
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = "us.beiyue.beilinentryportability.common.LitematicWriterRoundTripTest"
+}
+
+tasks.register("portabilityBridgeDispatchTest", JavaExec) {
+	dependsOn tasks.named("testClasses")
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = "us.beiyue.beilinentryportability.common.PortabilityBridgeDispatchTest"
+}
+
+tasks.named("check") {
+	dependsOn tasks.named("uploadFlowTest")
+	dependsOn tasks.named("storageTest")
+	dependsOn tasks.named("litematicRoundTripTest")
+	dependsOn tasks.named("portabilityBridgeDispatchTest")
+}
+
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			artifactId = "beilin-entry-portability-common"
+			from components.java
+		}
+	}
+}

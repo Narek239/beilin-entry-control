@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "beilin-entry-portability",
+  "version": "${version}",
+  "name": "Beilin Entry Portability",
+  "description": "Data portability export addon for Beilin Entry Control",
+  "authors": [
+    "Me!"
+  ],
+  "license": "CC0-1.0",
+  "environment": "server",
+  "entrypoints": {
+    "main": [
+      "us.beiyue.beilinentryportability.platform.fabric1201.BeilinEntryPortability1201"
+    ]
+  },
+  "mixins": [
+    "beilin-entry-portability-1201.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "~1.20.1",
+    "java": ">=17",
+    "fabric-api": "*",
+    "beilin-entry-control": ">=1.2.1"
+  }
+}

@@ -1,0 +1,59 @@
+plugins {
+	id "net.fabricmc.fabric-loom-remap" version "${loom_version}"
+	id "maven-publish"
+}
+
+base {
+	archivesName = "beilin-entry-portability-fabric-1.20.1"
+}
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+	withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 17
+}
+
+loom {
+	splitEnvironmentSourceSets()
+	mods {
+		"beilin-entry-portability" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:1.20.1"
+	mappings loom.officialMojangMappings()
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_1201_version}"
+
+	implementation project(":common")
+	implementation project(":portability-common")
+	implementation "org.xerial:sqlite-jdbc:${project.sqlite_jdbc_version}"
+	include project(":common")
+	include project(":portability-common")
+	include "org.xerial:sqlite-jdbc:${project.sqlite_jdbc_version}"
+}
+
+processResources {
+	inputs.property "version", project.version
+	filesMatching("fabric.mod.json") {
+		expand "version": inputs.properties.version
+	}
+}
+
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			artifactId = "beilin-entry-portability-fabric-1.20.1"
+			from components.java
+		}
+	}
+}

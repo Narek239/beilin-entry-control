@@ -16,6 +16,9 @@ jobs:
           - name: common
             task: ":common:build"
             java: "21"
+          - name: portability-common
+            task: ":portability-common:build"
+            java: "21"
           - name: platform-1.19.2
             task: ":platform-fabric-1.19.2:build"
             java: "21"
@@ -24,6 +27,15 @@ jobs:
             java: "21"
           - name: platform-1.21.x
             task: ":platform-fabric-1.21.x:build"
+            java: "21"
+          - name: portability-1.19.2
+            task: ":portability-fabric-1.19.2:build"
+            java: "21"
+          - name: portability-1.20.1
+            task: ":portability-fabric-1.20.1:build"
+            java: "21"
+          - name: portability-1.21.x
+            task: ":portability-fabric-1.21.x:build"
             java: "21"
     steps:
       - name: checkout repository
@@ -48,3 +60,7 @@ jobs:
             platform-fabric-1.19.2/build/libs/*.jar
             platform-fabric-1.20.1/build/libs/*.jar
             platform-fabric-1.21.x/build/libs/*.jar
+            portability-common/build/libs/*.jar
+            portability-fabric-1.19.2/build/libs/*.jar
+            portability-fabric-1.20.1/build/libs/*.jar
+            portability-fabric-1.21.x/build/libs/*.jar

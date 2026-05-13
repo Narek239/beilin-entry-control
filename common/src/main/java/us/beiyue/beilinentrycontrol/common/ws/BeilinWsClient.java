@@ -1,5 +1,7 @@
 package us.beiyue.beilinentrycontrol.common.ws;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import okhttp3.OkHttpClient;
@@ -21,6 +23,7 @@ import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -32,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.Objects;
@@ -94,6 +98,7 @@ public final class BeilinWsClient {
 
 	private final AtomicReference<WebSocket> wsRef = new AtomicReference<>();
 	private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
+	private final AtomicBoolean stopped = new AtomicBoolean(false);
 
 	private ScheduledFuture<?> pingTask;
 	private ScheduledFuture<?> pongWatchdog;
@@ -139,6 +144,11 @@ public final class BeilinWsClient {
 
 	public void start() {
 		gateState.setAcceptingPlayers(false);
+		if (scheduler.isShutdown()) {
+			log.warn("Beilin WS: cannot start after scheduler shutdown");
+			return;
+		}
+		stopped.set(false);
 		intentionalClose = false;
 		nextReconnectDelaySec = RECONNECT_INITIAL_SEC;
 		connectFailCount = 0;
@@ -155,11 +165,14 @@ public final class BeilinWsClient {
 	}
 
 	public void stop() {
+		stopped.set(true);
 		intentionalClose = true;
+		reconnectScheduled.set(false);
 		cancelTimers();
 		cancelPrimaryProbe();
 		WebSocket w = wsRef.getAndSet(null);
 		if (w != null) {
+			BeilinWsEvents.setExportJobsRequester(null);
 			try {
 				w.close(NORMAL_CLOSURE, "shutdown");
 			} catch (Exception ignored) {
@@ -168,12 +181,46 @@ public final class BeilinWsClient {
 		scheduler.shutdownNow();
 	}
 
-	private void runOnScheduler(Runnable r) {
-		scheduler.execute(r);
+	boolean runOnScheduler(Runnable r) {
+		if (r == null || isStopped()) return false;
+		try {
+			scheduler.execute(() -> {
+				if (!isStopped()) r.run();
+			});
+			return true;
+		} catch (RejectedExecutionException ignored) {
+			return false;
+		}
+	}
+
+	private ScheduledFuture<?> scheduleOnScheduler(Runnable r, long delay, TimeUnit unit) {
+		if (r == null || isStopped()) return null;
+		try {
+			return scheduler.schedule(() -> {
+				if (!isStopped()) r.run();
+			}, delay, unit);
+		} catch (RejectedExecutionException ignored) {
+			return null;
+		}
+	}
+
+	private ScheduledFuture<?> scheduleAtFixedRateOnScheduler(Runnable r, long initialDelay, long period, TimeUnit unit) {
+		if (r == null || isStopped()) return null;
+		try {
+			return scheduler.scheduleAtFixedRate(() -> {
+				if (!isStopped()) r.run();
+			}, initialDelay, period, unit);
+		} catch (RejectedExecutionException ignored) {
+			return null;
+		}
+	}
+
+	private boolean isStopped() {
+		return stopped.get() || scheduler.isShutdown() || scheduler.isTerminated();
 	}
 
 	private void connectAsync() {
-		if (intentionalClose) return;
+		if (intentionalClose || isStopped()) return;
 		if (!config.isValid()) {
 			log.warn("Beilin WS: config invalid, not reconnecting");
 			return;
@@ -251,6 +298,7 @@ public final class BeilinWsClient {
 		InetAddress backupIpTried,
 		SilentCloseMode closeMode
 	) {
+		if (isStopped()) return;
 		connectFailCount++;
 		boolean logDetail = connectFailCount <= 5 || connectFailCount % LOG_WARN_EVERY_N_FAILURES == 0;
 		if (logDetail) {
@@ -276,6 +324,7 @@ public final class BeilinWsClient {
 	 * PRIMARY retry failure -> BACKUP try; BACKUP retry failure -> PRIMARY try; chain exhaustion -> loud mode.
 	 */
 	private boolean handleSilentConnectFailed(SilentCloseMode closeMode) {
+		if (isStopped()) return true;
 		switch (closeMode) {
 			case SILENT_PRIMARY_RETRY:
 				routeState.setOutboundRoute(OutboundRoute.BACKUP);
@@ -302,7 +351,7 @@ public final class BeilinWsClient {
 	 * PRIMARY failure → BACKUP immediately. BACKUP failure → try another backup IP when present, else PRIMARY + backoff.
 	 */
 	private void scheduleHandshakeFailureReconnect(OutboundRoute failedRoute) {
-		if (intentionalClose) return;
+		if (intentionalClose || isStopped()) return;
 		if (!reconnectScheduled.compareAndSet(false, true)) return;
 
 		long delaySec;
@@ -328,10 +377,11 @@ public final class BeilinWsClient {
 			pendingScheduleRoute = OutboundRoute.PRIMARY;
 		}
 
-		scheduler.schedule(() -> {
+		ScheduledFuture<?> scheduled = scheduleOnScheduler(() -> {
 			reconnectScheduled.set(false);
 			connectAsync();
 		}, delaySec, TimeUnit.SECONDS);
+		if (scheduled == null) reconnectScheduled.set(false);
 	}
 
 	/** @return {@code true} if another BACKUP IP is available this cycle (cursor advanced); {@code false} to give up BACKUP sweep. */
@@ -398,7 +448,7 @@ public final class BeilinWsClient {
 	}
 
 	private void scheduleReconnect() {
-		if (intentionalClose) return;
+		if (intentionalClose || isStopped()) return;
 		if (!reconnectScheduled.compareAndSet(false, true)) return;
 		long delay = nextReconnectDelaySec;
 		nextReconnectDelaySec = Math.min((long) (nextReconnectDelaySec * RECONNECT_BACKOFF_MULTIPLIER), RECONNECT_MAX_SEC);
@@ -410,13 +460,15 @@ public final class BeilinWsClient {
 			pendingScheduleRoute = null;
 		}
 
-		scheduler.schedule(() -> {
+		ScheduledFuture<?> scheduled = scheduleOnScheduler(() -> {
 			reconnectScheduled.set(false);
 			connectAsync();
 		}, delay, TimeUnit.SECONDS);
+		if (scheduled == null) reconnectScheduled.set(false);
 	}
 
 	private void onWsDown(boolean kickPlayers) {
+		if (isStopped()) return;
 		gateState.setAcceptingPlayers(false);
 		if (kickPlayers) {
 			hooks.runOnServerThread(() -> hooks.kickAll(EntryGateState.SYNC_MESSAGE));
@@ -424,7 +476,9 @@ public final class BeilinWsClient {
 	}
 
 	private void onWsUp(WebSocket ws) {
+		if (isStopped()) return;
 		wsRef.set(ws);
+		BeilinWsEvents.setExportJobsRequester(() -> requestExportJobs(ws));
 		lastPongTime = System.currentTimeMillis();
 		nextReconnectDelaySec = RECONNECT_INITIAL_SEC;
 		connectFailCount = 0;
@@ -432,10 +486,23 @@ public final class BeilinWsClient {
 		startHeartbeat(ws);
 		// Auth server clears online players on each new WebSocket; re-register everyone in-world.
 		syncOnlinePlayersAfterWsConnect();
+		requestExportJobs(ws);
+	}
+
+	private void requestExportJobs(WebSocket ws) {
+		try {
+			if (ws != null && wsRef.get() == ws && ws.send("{\"action\":\"export_jobs_request\"}")) {
+				log.debug("Beilin WS requested export jobs");
+			}
+		} catch (Exception e) {
+			log.warn("Beilin WS export job request failed: {}", e.toString());
+		}
 	}
 
 	private void syncOnlinePlayersAfterWsConnect() {
+		if (isStopped()) return;
 		hooks.runOnServerThread(() -> {
+			if (isStopped()) return;
 			List<String> players = hooks.getOnlineUsernames();
 			if (players == null || players.isEmpty()) return;
 			for (String username : players) {
@@ -453,14 +520,14 @@ public final class BeilinWsClient {
 
 	private void startHeartbeat(WebSocket ws) {
 		cancelTimers();
-		pingTask = scheduler.scheduleAtFixedRate(() -> {
+		pingTask = scheduleAtFixedRateOnScheduler(() -> {
 			try {
 				if (!ws.send("{\"action\":\"ping\"}")) {
 					log.warn("Beilin WS ping send failed: output queue closed");
 					return;
 				}
 				if (pongWatchdog != null) pongWatchdog.cancel(false);
-				pongWatchdog = scheduler.schedule(() -> {
+				pongWatchdog = scheduleOnScheduler(() -> {
 					if (System.currentTimeMillis() - lastPongTime > PONG_TIMEOUT_SEC * 1000L) {
 						log.warn("Beilin WS pong timeout, aborting");
 						ws.cancel();
@@ -488,14 +555,14 @@ public final class BeilinWsClient {
 
 	private void ensurePrimaryProbe() {
 		cancelPrimaryProbe();
-		if (intentionalClose || loud1006Disconnects) return;
+		if (intentionalClose || isStopped() || loud1006Disconnects) return;
 		if (routeState.getOutboundRoute() != OutboundRoute.BACKUP) return;
 		long sec = config.wsPrimaryProbeIntervalSec();
-		primaryProbeTask = scheduler.scheduleAtFixedRate(this::runPrimaryProbe, sec, sec, TimeUnit.SECONDS);
+		primaryProbeTask = scheduleAtFixedRateOnScheduler(this::runPrimaryProbe, sec, sec, TimeUnit.SECONDS);
 	}
 
 	private void runPrimaryProbe() {
-		if (intentionalClose || loud1006Disconnects) return;
+		if (intentionalClose || isStopped() || loud1006Disconnects) return;
 		if (routeState.getOutboundRoute() != OutboundRoute.BACKUP) return;
 		if (pendingSilentCloseMode != SilentCloseMode.NORMAL) return;
 		try {
@@ -552,6 +619,7 @@ public final class BeilinWsClient {
 	}
 
 	private void handleTextMessage(String text) {
+		if (isStopped()) return;
 		try {
 			log.debug("Beilin WS recv: {}", text);
 			JsonObject o = JsonParser.parseString(text).getAsJsonObject();
@@ -574,13 +642,66 @@ public final class BeilinWsClient {
 				final String kickUsername = username;
 				final String kickReason = reason;
 				hooks.runOnServerThread(() -> hooks.kickByUsername(kickUsername, kickReason));
+				return;
+			}
+			if ("export_jobs".equals(action)) {
+				List<WsExportJob> jobs = parseExportJobs(o);
+				if (!jobs.isEmpty()) {
+					log.info("Beilin WS export queue has {} pending job(s)", jobs.size());
+					BeilinWsEvents.dispatchExportJobs(jobs);
+					forwardExportJobsToPortabilityBridge(text);
+				}
 			}
 		} catch (Exception e) {
 			log.warn("Beilin WS message parse failed: {}", e.toString());
 		}
 	}
 
+	private static List<WsExportJob> parseExportJobs(JsonObject root) {
+		JsonArray jobs = root.has("jobs") && root.get("jobs").isJsonArray()
+			? root.getAsJsonArray("jobs")
+			: new JsonArray();
+		List<WsExportJob> out = new ArrayList<>();
+		for (JsonElement e : jobs) {
+			if (!e.isJsonObject()) continue;
+			JsonObject o = e.getAsJsonObject();
+			long id = o.has("request_id") ? o.get("request_id").getAsLong() : 0L;
+			String username = stringOrNull(o, "minecraft_username");
+			if (id <= 0 || username == null || username.isBlank()) continue;
+			out.add(new WsExportJob(
+				id,
+				username,
+				stringOrNull(o, "requested_at"),
+				stringOrNull(o, "reviewed_at")
+			));
+		}
+		return out;
+	}
+
+	private static String stringOrNull(JsonObject o, String key) {
+		if (!o.has(key) || o.get(key).isJsonNull() || !o.get(key).isJsonPrimitive()) {
+			return null;
+		}
+		return o.get(key).getAsString();
+	}
+
+	private void forwardExportJobsToPortabilityBridge(String text) {
+		try {
+			Class<?> bridge = Class.forName("us.beiyue.beilinentryportability.common.PortabilityBridge");
+			Method accept = bridge.getMethod("acceptExportJobsJson", String.class);
+			accept.invoke(null, text);
+			Method count = bridge.getMethod("listenerCount");
+			Object listeners = count.invoke(null);
+			log.info("Beilin WS forwarded export jobs to portability bridge (listeners={})", listeners);
+		} catch (ClassNotFoundException ignored) {
+			log.debug("Beilin WS portability bridge not present");
+		} catch (Exception e) {
+			log.warn("Beilin WS portability bridge dispatch failed: {}", e.toString());
+		}
+	}
+
 	private void handleOpen(WebSocket webSocket, OutboundRoute connectRoute, SilentCloseMode closeMode) {
+		if (isStopped()) return;
 		if (closeMode == SilentCloseMode.NORMAL) {
 			log.info("Beilin WS connected");
 		} else {
@@ -598,6 +719,7 @@ public final class BeilinWsClient {
 	}
 
 	private void handleClose(WebSocket webSocket, int statusCode, String reason, OutboundRoute connectRoute, SilentCloseMode closeMode) {
+		if (isStopped()) return;
 		boolean is1006 = (statusCode == 1006);
 		if (is1006) {
 			log.debug("Beilin WS closed 1006, reconnecting without kick (until loud mode)");
@@ -608,6 +730,7 @@ public final class BeilinWsClient {
 		if (intentionalClose || !wasActive) {
 			return;
 		}
+		BeilinWsEvents.setExportJobsRequester(null);
 		cancelTimers();
 
 		if (statusCode == NORMAL_CLOSURE && "switch_to_primary".equals(reason)) {
@@ -685,6 +808,7 @@ public final class BeilinWsClient {
 		InetAddress backupIpTried,
 		boolean opened
 	) {
+		if (isStopped()) return;
 		if (wsRef.get() == webSocket) {
 			handleClose(webSocket, 1006, error != null ? error.toString() : "", connectRoute, closeMode);
 			return;

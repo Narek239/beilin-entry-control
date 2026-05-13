@@ -20,6 +20,27 @@ tasks.withType(JavaCompile).configureEach {
 	options.release = 17
 }
 
+tasks.named("test", Test) {
+	failOnNoDiscoveredTests = false
+}
+
+tasks.register("wsShutdownTest", JavaExec) {
+	dependsOn tasks.named("testClasses")
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = "us.beiyue.beilinentrycontrol.common.ws.BeilinWsClientShutdownTest"
+}
+
+tasks.register("wsExportJobsTest", JavaExec) {
+	dependsOn tasks.named("testClasses")
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = "us.beiyue.beilinentrycontrol.common.ws.BeilinWsClientExportJobsTest"
+}
+
+tasks.named("check") {
+	dependsOn tasks.named("wsShutdownTest")
+	dependsOn tasks.named("wsExportJobsTest")
+}
+
 publishing {
 	publications {
 		create("mavenJava", MavenPublication) {
