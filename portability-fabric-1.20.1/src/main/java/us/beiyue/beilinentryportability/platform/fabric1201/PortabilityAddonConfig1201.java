@@ -19,8 +19,8 @@ public final class PortabilityAddonConfig1201 {
 	public boolean recordingEnabled = true;
 	public boolean claimJobs = true;
 	public String artifactDirectory = "beilin-entry-portability-exports";
-	public int maxExportVolumeBlocks = 2_000_000;
-	public int scanChunksPerTick = 4;
+	public int maxExportVolumeBlocks = 4_000_000;
+	public int scanChunksPerTick = 12;
 
 	public static Path configPath() {
 		return FabricLoader.getInstance().getConfigDir().resolve(FILE_NAME);

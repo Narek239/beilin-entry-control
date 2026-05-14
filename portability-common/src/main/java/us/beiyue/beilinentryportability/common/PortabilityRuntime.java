@@ -26,7 +26,7 @@ public final class PortabilityRuntime {
 	private final ScheduledExecutorService scheduler;
 	private final PortabilityBridge.Listener exportJobsListener = this::onExportJobs;
 	private final Queue<ExportJob> pendingJobs = new ArrayDeque<>();
-	private final Set<Long> pendingJobIds = new HashSet<>();
+	private final Set<Long> acceptedJobIds = new HashSet<>();
 	private final AtomicBoolean processing = new AtomicBoolean(false);
 	private final AtomicBoolean stopped = new AtomicBoolean(false);
 	private final AtomicBoolean started = new AtomicBoolean(false);
@@ -91,7 +91,7 @@ public final class PortabilityRuntime {
 
 	private void enqueueJob(ExportJob job) {
 		if (job == null || job.requestId <= 0) return;
-		if (pendingJobIds.add(job.requestId)) {
+		if (acceptedJobIds.add(job.requestId)) {
 			pendingJobs.add(job);
 		}
 	}
@@ -100,7 +100,6 @@ public final class PortabilityRuntime {
 		if (stopped.get() || processing.get()) return;
 		ExportJob next = pendingJobs.poll();
 		if (next == null) return;
-		pendingJobIds.remove(next.requestId);
 		processJob(next);
 	}
 
@@ -113,7 +112,7 @@ public final class PortabilityRuntime {
 			}
 			if (!claimed) {
 				log.warn("Portability export job {} was not claimed; it may have been taken or changed state.", job.requestId);
-				return CompletableFuture.completedFuture(false);
+				return CompletableFuture.completedFuture(true);
 			}
 			try {
 				if (stopped.get()) return CompletableFuture.completedFuture(false);
@@ -146,6 +145,7 @@ public final class PortabilityRuntime {
 					apiClient.failJobAsync(job.requestId, "ExportDeliveryFailed");
 				}
 			} finally {
+				acceptedJobIds.remove(job.requestId);
 				processing.set(false);
 				processNextJob();
 			}
