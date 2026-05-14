@@ -31,7 +31,6 @@ public final class BuildingIndexStoreStorageTest {
 			store.recordPlaced("minecraft:overworld", 7, 64, 0, "minecraft:stone", "Alice");
 			store.recordStateChangeWithSource("minecraft:overworld", 3, 64, 0, "minecraft:air", "minecraft:lantern", "SYSTEM", "SYSTEM_SET_BLOCK");
 			store.recordStateChangeWithSource("minecraft:overworld", 8, 64, 0, "minecraft:air", "minecraft:wall_torch", "UNKNOWN", "SYSTEM_SET_BLOCK");
-			store.flushPendingWrites();
 			insertLongRailRegion(db);
 
 			ExportBundle bundle = store.buildExportBundle(

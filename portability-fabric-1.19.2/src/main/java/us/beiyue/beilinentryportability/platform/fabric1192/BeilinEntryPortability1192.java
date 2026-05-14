@@ -87,11 +87,6 @@ public final class BeilinEntryPortability1192 implements ModInitializer {
 			runtime = null;
 		}
 		if (indexStore != null) {
-			try {
-				indexStore.flushPendingWrites();
-			} catch (Exception e) {
-				LOGGER.warn("Failed to flush Beilin Entry Portability index on stop", e);
-			}
 			indexStore.close();
 			indexStore = null;
 		}
@@ -99,8 +94,6 @@ public final class BeilinEntryPortability1192 implements ModInitializer {
 	}
 
 	public static void flushIndexForWorldSave() {
-		BuildingIndexStore store = activeStore;
-		if (store != null) store.flushPendingWrites();
 	}
 
 	public static void checkpointIndexAfterWorldSave() {

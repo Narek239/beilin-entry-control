@@ -21,20 +21,16 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class BuildingIndexStore {
 	private static final int SCHEMA_VERSION = 6;
-	private static final int PENDING_FLUSH_BATCH_SIZE = 1000;
 	private static final int REGION_MERGE_GAP_BLOCKS = 2;
 	private static final int MAX_AUTO_REGION_VOLUME = 2_000_000;
 	private static final int MIN_EXPORT_COMPONENT_BLOCKS = 8;
 	private static final int LINEAR_MIN_LONG_AXIS = 32;
 	private static final int LINEAR_MAX_CROSS_AXIS = 3;
+	private static final int LINEAR_WIDE_MAX_CROSS = 12;
+	private static final int LINEAR_WIDE_MIN_ASPECT = 16;
 	private static final int[][] NEIGHBORS = {
 		{1, 0, 0}, {-1, 0, 0},
 		{0, 1, 0}, {0, -1, 0},
@@ -44,20 +40,12 @@ public final class BuildingIndexStore {
 	private final Path dbPath;
 	private final CommonLogger log;
 	private final Connection connection;
-	private final ExecutorService writerExecutor;
-	private final AtomicBoolean flushScheduled = new AtomicBoolean(false);
-	private final List<PendingChange> pendingChanges = new ArrayList<>();
 	private volatile boolean closed = false;
 
 	private BuildingIndexStore(Path dbPath, CommonLogger log, Connection connection) {
 		this.dbPath = dbPath;
 		this.log = log;
 		this.connection = connection;
-		this.writerExecutor = Executors.newSingleThreadExecutor(r -> {
-			Thread t = new Thread(r, "beilin-entry-portability-db");
-			t.setDaemon(true);
-			return t;
-		});
 	}
 
 	public static BuildingIndexStore open(Path dbPath, CommonLogger log) throws IOException {
@@ -76,75 +64,36 @@ public final class BuildingIndexStore {
 	}
 
 	public synchronized int size() {
-		flushPendingWrites();
 		return countRegions();
 	}
 
-	public void close() {
+	public synchronized void close() {
 		closed = true;
-		writerExecutor.shutdown();
 		try {
-			writerExecutor.awaitTermination(1, TimeUnit.SECONDS);
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-		}
-		synchronized (this) {
-			try {
-				flushPendingWrites();
-			} finally {
-				try {
-					connection.close();
-				} catch (SQLException ignored) {
-				}
-			}
+			connection.close();
+		} catch (SQLException ignored) {
 		}
 	}
 
+	/** @deprecated No-op. Retained for API compatibility with Mixin and platform callers. */
 	public synchronized void flushPendingWrites() {
-		if (pendingChanges.isEmpty()) return;
-		boolean originalAutoCommit = true;
-		List<PendingChange> changes = new ArrayList<>(pendingChanges);
-		pendingChanges.clear();
-		try {
-			originalAutoCommit = connection.getAutoCommit();
-			connection.setAutoCommit(false);
-			for (PendingChange change : changes) {
-				applyChange(change);
-			}
-			connection.commit();
-		} catch (SQLException e) {
-			try {
-				connection.rollback();
-			} catch (SQLException ignored) {
-			}
-			log.warn("Failed to flush portability pending region changes: {}", e.toString());
-		} finally {
-			try {
-				connection.setAutoCommit(originalAutoCommit);
-			} catch (SQLException ignored) {
-			}
-		}
 	}
 
 	public synchronized void checkpoint() throws SQLException {
-		flushPendingWrites();
 		try (Statement stmt = connection.createStatement()) {
 			stmt.execute("PRAGMA wal_checkpoint(TRUNCATE)");
 		}
 	}
 
 	public synchronized void compact() throws SQLException {
-		flushPendingWrites();
 		try (Statement stmt = connection.createStatement()) {
 			stmt.execute("VACUUM");
 		}
 	}
 
 	public synchronized String diagnosticSummary() {
-		flushPendingWrites();
 		return "db=" + dbPath
 			+ ", indexed_regions=" + countRegions()
-			+ ", pending_changes=" + pendingChanges.size()
 			+ ", schema=v" + SCHEMA_VERSION;
 	}
 
@@ -179,13 +128,31 @@ public final class BuildingIndexStore {
 		String actorName,
 		String source
 	) {
+		if (closed) return;
 		if (newBlockState == null || newBlockState.isBlank()) return;
 		String actor = displayActorName(actorName);
 		if (!isPlayerActor(actor)) return;
 		boolean newAir = isAirState(newBlockState);
 		boolean firstPlacement = !newAir && isAirState(oldBlockState);
 		if (!newAir && !firstPlacement) return;
-		enqueue(new PendingChange(dimensionName(dimension), x, y, z, oldBlockState, newBlockState, actor));
+		boolean originalAutoCommit = true;
+		try {
+			originalAutoCommit = connection.getAutoCommit();
+			connection.setAutoCommit(false);
+			applyChange(new PendingChange(dimensionName(dimension), x, y, z, oldBlockState, newBlockState, actor));
+			connection.commit();
+		} catch (SQLException e) {
+			try {
+				connection.rollback();
+			} catch (SQLException ignored) {
+			}
+			log.warn("Failed to apply portability block change at {},{},{}: {}", x, y, z, e.toString());
+		} finally {
+			try {
+				connection.setAutoCommit(originalAutoCommit);
+			} catch (SQLException ignored) {
+			}
+		}
 	}
 
 	public ExportManifest buildManifest(ExportJob job, WorldBlockReader reader, int maxExportVolumeBlocks) throws IOException {
@@ -197,7 +164,6 @@ public final class BuildingIndexStore {
 		List<RegionExportPlan> plans;
 		int indexedRegionCount;
 		synchronized (this) {
-			flushPendingWrites();
 			try {
 				List<Region> regions = regionsForAuthor(target);
 				plans = new ArrayList<>(regions.size());
@@ -303,39 +269,6 @@ public final class BuildingIndexStore {
 			exports.stream().map(e -> e.summary).toList()
 		);
 		return new ExportBundle(manifest, exports);
-	}
-
-	private void enqueue(PendingChange change) {
-		pendingChanges.add(change);
-		if (pendingChanges.size() >= PENDING_FLUSH_BATCH_SIZE) {
-			requestBackgroundFlush();
-		}
-	}
-
-	public void requestBackgroundFlush() {
-		scheduleFlushAsync();
-	}
-
-	private void scheduleFlushAsync() {
-		if (closed || !flushScheduled.compareAndSet(false, true)) return;
-		try {
-			writerExecutor.execute(() -> {
-				try {
-					flushPendingWrites();
-				} finally {
-					flushScheduled.set(false);
-					if (!closed && pendingChangeCount() >= PENDING_FLUSH_BATCH_SIZE) {
-						scheduleFlushAsync();
-					}
-				}
-			});
-		} catch (RejectedExecutionException ignored) {
-			flushScheduled.set(false);
-		}
-	}
-
-	private synchronized int pendingChangeCount() {
-		return pendingChanges.size();
 	}
 
 	private void applyChange(PendingChange change) throws SQLException {
@@ -1056,9 +989,13 @@ public final class BuildingIndexStore {
 		int longest = Math.max(x, Math.max(y, z));
 		int shortest = Math.min(x, Math.min(y, z));
 		int middle = x + y + z - longest - shortest;
+		int crossMax = Math.max(middle, shortest);
 		boolean horizontal = x == longest || z == longest;
 		if (longest < LINEAR_MIN_LONG_AXIS) return false;
-		if (middle > LINEAR_MAX_CROSS_AXIS || shortest > LINEAR_MAX_CROSS_AXIS) return false;
+		boolean narrow = crossMax <= LINEAR_MAX_CROSS_AXIS;
+		boolean wideLinear = crossMax <= LINEAR_WIDE_MAX_CROSS
+			&& longest >= LINEAR_WIDE_MIN_ASPECT * crossMax;
+		if (!narrow && !wideLinear) return false;
 		if (horizontal) return true;
 		int volume = safeVolume(bounds);
 		return volume <= 0 || nonAir <= 0 || nonAir * 10000L / volume < 4500;
