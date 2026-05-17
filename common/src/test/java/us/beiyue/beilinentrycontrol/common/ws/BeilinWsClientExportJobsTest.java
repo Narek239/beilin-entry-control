@@ -44,14 +44,15 @@ public final class BeilinWsClientExportJobsTest {
 			throw new AssertionError("unexpected export job payload");
 		}
 
-		final boolean[] requested = { false };
-		BeilinWsEvents.setExportJobsRequester(() -> requested[0] = true);
+		List<WsExportJob> cached = new ArrayList<>();
+		ExportJobsListener lateListener = cached::addAll;
+		BeilinWsEvents.addExportJobsListener(lateListener);
 		try {
-			if (!BeilinWsEvents.requestExportJobs() || !requested[0]) {
-				throw new AssertionError("export job requester was not invoked");
+			if (cached.size() != 1 || cached.get(0).requestId != 11L) {
+				throw new AssertionError("late export listener did not receive cached jobs");
 			}
 		} finally {
-			BeilinWsEvents.setExportJobsRequester(null);
+			BeilinWsEvents.removeExportJobsListener(lateListener);
 		}
 	}
 

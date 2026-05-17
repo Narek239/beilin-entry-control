@@ -172,7 +172,6 @@ public final class BeilinWsClient {
 		cancelPrimaryProbe();
 		WebSocket w = wsRef.getAndSet(null);
 		if (w != null) {
-			BeilinWsEvents.setExportJobsRequester(null);
 			try {
 				w.close(NORMAL_CLOSURE, "shutdown");
 			} catch (Exception ignored) {
@@ -478,7 +477,6 @@ public final class BeilinWsClient {
 	private void onWsUp(WebSocket ws) {
 		if (isStopped()) return;
 		wsRef.set(ws);
-		BeilinWsEvents.setExportJobsRequester(() -> requestExportJobs(ws));
 		lastPongTime = System.currentTimeMillis();
 		nextReconnectDelaySec = RECONNECT_INITIAL_SEC;
 		connectFailCount = 0;
@@ -730,7 +728,6 @@ public final class BeilinWsClient {
 		if (intentionalClose || !wasActive) {
 			return;
 		}
-		BeilinWsEvents.setExportJobsRequester(null);
 		cancelTimers();
 
 		if (statusCode == NORMAL_CLOSURE && "switch_to_primary".equals(reason)) {

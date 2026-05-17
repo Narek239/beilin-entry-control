@@ -31,12 +31,6 @@ public final class PortabilityApiClient {
 		this.config = Objects.requireNonNull(config, "config");
 	}
 
-	public CompletableFuture<Boolean> requestExportJobsPushAsync() {
-		return postJson("/exports/request_push", "{}")
-			.thenApply(r -> r.statusCode >= 200 && r.statusCode < 300)
-			.exceptionally(ex -> false);
-	}
-
 	public CompletableFuture<Boolean> claimJobAsync(long requestId) {
 		return postJson("/exports/" + requestId + "/claim", "{}")
 			.thenApply(r -> r.statusCode >= 200 && r.statusCode < 300)

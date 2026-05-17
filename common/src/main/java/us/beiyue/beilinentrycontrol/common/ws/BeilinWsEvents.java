@@ -6,13 +6,18 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 public final class BeilinWsEvents {
 	private static final CopyOnWriteArrayList<ExportJobsListener> EXPORT_JOB_LISTENERS = new CopyOnWriteArrayList<>();
-	private static volatile Runnable exportJobsRequester;
+	private static volatile List<WsExportJob> lastExportJobs = List.of();
 
 	private BeilinWsEvents() {
 	}
 
 	public static void addExportJobsListener(ExportJobsListener listener) {
-		EXPORT_JOB_LISTENERS.add(Objects.requireNonNull(listener, "listener"));
+		ExportJobsListener safeListener = Objects.requireNonNull(listener, "listener");
+		EXPORT_JOB_LISTENERS.add(safeListener);
+		List<WsExportJob> cached = lastExportJobs;
+		if (!cached.isEmpty()) {
+			safeListener.onExportJobs(cached);
+		}
 	}
 
 	public static void removeExportJobsListener(ExportJobsListener listener) {
@@ -23,21 +28,9 @@ public final class BeilinWsEvents {
 
 	static void dispatchExportJobs(List<WsExportJob> jobs) {
 		List<WsExportJob> safeJobs = jobs == null ? List.of() : List.copyOf(jobs);
+		lastExportJobs = safeJobs;
 		for (ExportJobsListener listener : EXPORT_JOB_LISTENERS) {
 			listener.onExportJobs(safeJobs);
 		}
-	}
-
-	static void setExportJobsRequester(Runnable requester) {
-		exportJobsRequester = requester;
-	}
-
-	public static boolean requestExportJobs() {
-		Runnable requester = exportJobsRequester;
-		if (requester == null) {
-			return false;
-		}
-		requester.run();
-		return true;
 	}
 }

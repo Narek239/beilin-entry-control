@@ -1,7 +1,6 @@
 package us.beiyue.beilinentryportability.common;
 
 import us.beiyue.beilinentrycontrol.common.log.CommonLogger;
-import us.beiyue.beilinentrycontrol.common.ws.BeilinWsEvents;
 
 import java.nio.file.Path;
 import java.util.ArrayDeque;
@@ -58,10 +57,6 @@ public final class PortabilityRuntime {
 		stopped.set(false);
 		if (!started.compareAndSet(false, true)) return;
 		PortabilityBridge.addListener(exportJobsListener);
-		if (!BeilinWsEvents.requestExportJobs()) {
-			log.info("Beilin Entry Portability waiting for WebSocket export job push");
-		}
-		apiClient.requestExportJobsPushAsync();
 		log.info("Beilin Entry Portability export push listener started");
 	}
 
