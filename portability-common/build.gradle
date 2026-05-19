@@ -47,11 +47,18 @@ tasks.register("portabilityBridgeDispatchTest", JavaExec) {
 	mainClass = "us.beiyue.beilinentryportability.common.PortabilityBridgeDispatchTest"
 }
 
+tasks.register("runtimeStopTest", JavaExec) {
+	dependsOn tasks.named("testClasses")
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = "us.beiyue.beilinentryportability.common.PortabilityRuntimeStopTest"
+}
+
 tasks.named("check") {
 	dependsOn tasks.named("uploadFlowTest")
 	dependsOn tasks.named("storageTest")
 	dependsOn tasks.named("litematicRoundTripTest")
 	dependsOn tasks.named("portabilityBridgeDispatchTest")
+	dependsOn tasks.named("runtimeStopTest")
 }
 
 publishing {

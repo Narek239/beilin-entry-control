@@ -20,10 +20,11 @@ public final class BeilinWsClientShutdownTest {
 	public static void main(String[] args) throws Exception {
 		TestConfig config = new TestConfig();
 		OutboundRouteState routeState = new OutboundRouteState();
+		BeilinApiClient apiClient = new BeilinApiClient(config, routeState);
 		BeilinWsClient client = new BeilinWsClient(
 			config,
 			new TestHooks(),
-			new BeilinApiClient(config, routeState),
+			apiClient,
 			new EntryGateState(),
 			new TestLogger(),
 			routeState
@@ -47,6 +48,10 @@ public final class BeilinWsClientShutdownTest {
 			new Class<?>[] { WebSocket.class, int.class, String.class },
 			new Object[] { null, 1006, "shutdown" });
 		invoke(client, "scheduleReconnect", new Class<?>[0], new Object[0]);
+
+		if (apiClient.playerJoinAsync("Alice").get().ok) {
+			throw new AssertionError("api client accepted work after websocket stop");
+		}
 	}
 
 	@SuppressWarnings("unchecked")

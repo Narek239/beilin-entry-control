@@ -11,7 +11,6 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -23,7 +22,7 @@ import java.util.Map;
 import java.util.Set;
 
 public final class BuildingIndexStore {
-	private static final int SCHEMA_VERSION = 6;
+	private static final int SCHEMA_VERSION = 7;
 	private static final int REGION_MERGE_GAP_BLOCKS = 2;
 	private static final int MAX_AUTO_REGION_VOLUME = 2_000_000;
 	private static final int MIN_EXPORT_COMPONENT_BLOCKS = 8;
@@ -76,6 +75,7 @@ public final class BuildingIndexStore {
 	}
 
 	/** @deprecated No-op. Retained for API compatibility with Mixin and platform callers. */
+	@Deprecated
 	public synchronized void flushPendingWrites() {
 	}
 
@@ -165,23 +165,9 @@ public final class BuildingIndexStore {
 		int indexedRegionCount;
 		synchronized (this) {
 			try {
-				List<Region> regions = regionsForAuthor(target);
+				List<RegionExportPlan> regions = regionsForAuthor(target);
 				plans = new ArrayList<>(regions.size());
-				for (Region region : regions) {
-					plans.add(new RegionExportPlan(
-						region.id,
-						region.dimension,
-						region.minX,
-						region.minY,
-						region.minZ,
-						region.maxX,
-						region.maxY,
-						region.maxZ,
-						targetRatio(region.id, target),
-						targetLastTouched(region.id, target),
-						authorCount(region.id)
-					));
-				}
+				plans.addAll(regions);
 				indexedRegionCount = countRegions();
 			} catch (SQLException e) {
 				throw new IOException("Failed to read portability export regions", e);
@@ -190,6 +176,7 @@ public final class BuildingIndexStore {
 		List<ComponentExport> exports = new ArrayList<>();
 		int componentIndex = 1;
 		for (RegionExportPlan region : plans) {
+			ensureNotInterrupted();
 			List<BlockCoordinate> placedCoordinates;
 			synchronized (this) {
 				try {
@@ -204,13 +191,12 @@ public final class BuildingIndexStore {
 				}
 				continue;
 			}
-			List<BlockRecord> scanned = reader.scan(
-				region.dimension,
-				region.minX, region.minY, region.minZ,
-				region.maxX, region.maxY, region.maxZ,
-				maxExportVolumeBlocks
-			);
-			List<BlockRecord> ownedBlocks = filterToCoordinates(scanned, placedCoordinates);
+			int regionVolume = safeVolume(region);
+			if (regionVolume > maxExportVolumeBlocks) {
+				throw new IOException("export cuboid is too large: " + regionVolume + " > " + maxExportVolumeBlocks);
+			}
+			ensureNotInterrupted();
+			List<BlockRecord> ownedBlocks = reader.readCoordinates(region.dimension, placedCoordinates, maxExportVolumeBlocks);
 			List<List<BlockRecord>> groups = compactGroups(ownedBlocks, connectedGroups(ownedBlocks));
 			if (groups.isEmpty()) {
 				synchronized (this) {
@@ -220,6 +206,7 @@ public final class BuildingIndexStore {
 			}
 			int regionNonAir = 0;
 			for (List<BlockRecord> group : groups) {
+				ensureNotInterrupted();
 				Bounds bounds = Bounds.from(group);
 				List<BlockRecord> cuboidBlocks = blocksWithin(ownedBlocks, bounds);
 				int nonAir = cuboidBlocks.size();
@@ -264,7 +251,7 @@ public final class BuildingIndexStore {
 		ExportManifest manifest = new ExportManifest(
 			job.requestId,
 			job.minecraftUsername,
-			Instant.now().toString(),
+			SqliteUtcDatetimes.now(),
 			indexedRegionCount,
 			exports.stream().map(e -> e.summary).toList()
 		);
@@ -278,7 +265,7 @@ public final class BuildingIndexStore {
 		boolean firstPlacement = !newAir && isAirState(change.oldBlockState);
 		boolean playerCanExpandRegion = playerActor && firstPlacement;
 		Region region = findCandidateRegion(change.dimension, change.x, change.y, change.z, playerCanExpandRegion);
-		String now = Instant.now().toString();
+		String now = SqliteUtcDatetimes.now();
 
 		if (region == null && firstPlacement && playerActor) {
 			long id = insertRegion(change.dimension, change.x, change.y, change.z, now);
@@ -306,7 +293,6 @@ public final class BuildingIndexStore {
 
 		markDirty(region.id, now);
 		if (region != null) {
-			refreshChunkIndex(region.id);
 			refreshAuthorRatios(region.id);
 			refreshRiskFlags(region.id);
 			mergeCompatibleRegions(region.id);
@@ -319,42 +305,14 @@ public final class BuildingIndexStore {
 			stmt.execute("PRAGMA synchronous=NORMAL");
 			stmt.execute("PRAGMA foreign_keys=ON");
 		}
-		int version = userVersion();
-		if (version != SCHEMA_VERSION) {
-			resetSchema();
-		} else {
-			createSchemaV4();
-		}
+		createSchema();
+		normalizeStoredDatetimes();
 		try (Statement stmt = connection.createStatement()) {
 			stmt.execute("PRAGMA user_version=" + SCHEMA_VERSION);
 		}
 	}
 
-	private int userVersion() throws SQLException {
-		try (Statement stmt = connection.createStatement();
-			 ResultSet rs = stmt.executeQuery("PRAGMA user_version")) {
-			return rs.next() ? rs.getInt(1) : 0;
-		}
-	}
-
-	private void resetSchema() throws SQLException {
-		try (Statement stmt = connection.createStatement()) {
-			stmt.execute("DROP TABLE IF EXISTS region_chunk_index");
-			stmt.execute("DROP TABLE IF EXISTS region_blocks");
-			stmt.execute("DROP TABLE IF EXISTS region_authors");
-			stmt.execute("DROP TABLE IF EXISTS building_regions");
-			stmt.execute("DROP TABLE IF EXISTS current_blocks");
-			stmt.execute("DROP TABLE IF EXISTS block_events");
-			stmt.execute("DROP TABLE IF EXISTS components");
-			stmt.execute("DROP TABLE IF EXISTS player_component_activity");
-			stmt.execute("DROP TABLE IF EXISTS dimensions");
-			stmt.execute("DROP TABLE IF EXISTS player_names");
-			stmt.execute("DROP TABLE IF EXISTS block_states");
-		}
-		createSchemaV4();
-	}
-
-	private void createSchemaV4() throws SQLException {
+	private void createSchema() throws SQLException {
 		try (Statement stmt = connection.createStatement()) {
 			stmt.execute("""
 				CREATE TABLE IF NOT EXISTS building_regions (
@@ -408,17 +366,38 @@ public final class BuildingIndexStore {
 				)
 				""");
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_region_blocks_region ON region_blocks(region_id)");
-			stmt.execute("""
-				CREATE TABLE IF NOT EXISTS region_chunk_index (
-					region_id INTEGER NOT NULL REFERENCES building_regions(id) ON DELETE CASCADE,
-					dimension TEXT NOT NULL,
-					chunk_x INTEGER NOT NULL,
-					chunk_z INTEGER NOT NULL,
-					PRIMARY KEY (region_id, dimension, chunk_x, chunk_z)
-				)
-				""");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_region_chunk_index_lookup ON region_chunk_index(dimension, chunk_x, chunk_z)");
 		}
+	}
+
+	private void normalizeStoredDatetimes() throws SQLException {
+		normalizeDatetimeColumn("building_regions", "last_touched_at");
+		normalizeDatetimeColumn("building_regions", "last_scanned_at");
+		normalizeDatetimeColumn("building_regions", "created_at");
+		normalizeDatetimeColumn("building_regions", "updated_at");
+		normalizeDatetimeColumn("region_authors", "last_touched_at");
+		normalizeDatetimeColumn("region_blocks", "first_placed_at");
+		normalizeDatetimeColumn("region_blocks", "last_touched_at");
+	}
+
+	private void normalizeDatetimeColumn(String table, String column) throws SQLException {
+		if (!tableHasColumn(table, column)) return;
+		try (Statement stmt = connection.createStatement()) {
+			stmt.executeUpdate(
+				"UPDATE " + table +
+					" SET " + column + " = datetime(" + column + ")" +
+					" WHERE " + column + " LIKE '%T%' AND datetime(" + column + ") IS NOT NULL"
+			);
+		}
+	}
+
+	private boolean tableHasColumn(String table, String column) throws SQLException {
+		try (Statement stmt = connection.createStatement();
+			 ResultSet rs = stmt.executeQuery("PRAGMA table_info(" + table + ")")) {
+			while (rs.next()) {
+				if (column.equals(rs.getString("name"))) return true;
+			}
+		}
+		return false;
 	}
 
 	private long insertRegion(String dimension, int x, int y, int z, String now) throws SQLException {
@@ -444,7 +423,6 @@ public final class BuildingIndexStore {
 			 ResultSet rs = stmt.executeQuery("SELECT last_insert_rowid()")) {
 			if (rs.next()) {
 				long id = rs.getLong(1);
-				refreshChunkIndex(id);
 				return id;
 			}
 		}
@@ -631,7 +609,7 @@ public final class BuildingIndexStore {
 	}
 
 	private void mergeRegionInto(long targetId, long sourceId, Bounds merged) throws SQLException {
-		String now = Instant.now().toString();
+		String now = SqliteUtcDatetimes.now();
 		try (PreparedStatement ps = connection.prepareStatement("""
 			UPDATE building_regions
 			SET min_x = ?, min_y = ?, min_z = ?, max_x = ?, max_y = ?, max_z = ?,
@@ -690,35 +668,8 @@ public final class BuildingIndexStore {
 			ps.setLong(1, sourceId);
 			ps.executeUpdate();
 		}
-		refreshChunkIndex(targetId);
 		refreshAuthorRatios(targetId);
 		refreshRiskFlags(targetId);
-	}
-
-	private void refreshChunkIndex(long regionId) throws SQLException {
-		Region region = findRegion(regionId);
-		if (region == null) return;
-		try (PreparedStatement delete = connection.prepareStatement("DELETE FROM region_chunk_index WHERE region_id = ?");
-			 PreparedStatement insert = connection.prepareStatement(
-				 "INSERT OR IGNORE INTO region_chunk_index (region_id, dimension, chunk_x, chunk_z) VALUES (?, ?, ?, ?)"
-			 )) {
-			delete.setLong(1, regionId);
-			delete.executeUpdate();
-			int minChunkX = Math.floorDiv(region.minX, 16);
-			int maxChunkX = Math.floorDiv(region.maxX, 16);
-			int minChunkZ = Math.floorDiv(region.minZ, 16);
-			int maxChunkZ = Math.floorDiv(region.maxZ, 16);
-			for (int cx = minChunkX; cx <= maxChunkX; cx++) {
-				for (int cz = minChunkZ; cz <= maxChunkZ; cz++) {
-					insert.setLong(1, regionId);
-					insert.setString(2, region.dimension);
-					insert.setInt(3, cx);
-					insert.setInt(4, cz);
-					insert.addBatch();
-				}
-			}
-			insert.executeBatch();
-		}
 	}
 
 	private void refreshAuthorRatios(long regionId) throws SQLException {
@@ -754,7 +705,7 @@ public final class BuildingIndexStore {
 	}
 
 	private void markRegionScanned(long regionId, int nonAir, int volume, String extraRisk) {
-		String now = Instant.now().toString();
+		String now = SqliteUtcDatetimes.now();
 		int density = volume > 0 ? (int) Math.round(nonAir * 10000.0D / volume) : 0;
 		try (PreparedStatement ps = connection.prepareStatement("""
 			UPDATE building_regions
@@ -774,9 +725,16 @@ public final class BuildingIndexStore {
 		}
 	}
 
-	private List<Region> regionsForAuthor(String playerNameKey) throws SQLException {
+	private List<RegionExportPlan> regionsForAuthor(String playerNameKey) throws SQLException {
 		try (PreparedStatement ps = connection.prepareStatement("""
-			SELECT br.*
+			SELECT br.*,
+			       ra.ratio_bp AS target_ratio_bp,
+			       ra.last_touched_at AS target_last_touched_at,
+			       (
+			           SELECT COUNT(*)
+			           FROM region_authors ra2
+			           WHERE ra2.region_id = br.id AND ra2.contribution_score > 0
+			       ) AS author_count
 			FROM building_regions br
 			JOIN region_authors ra ON ra.region_id = br.id
 			WHERE br.status = 'active' AND ra.player_name_key = ? AND ra.contribution_score > 0
@@ -784,8 +742,8 @@ public final class BuildingIndexStore {
 			""")) {
 			ps.setString(1, playerNameKey);
 			try (ResultSet rs = ps.executeQuery()) {
-				List<Region> out = new ArrayList<>();
-				while (rs.next()) out.add(region(rs));
+				List<RegionExportPlan> out = new ArrayList<>();
+				while (rs.next()) out.add(regionExportPlan(rs));
 				return out;
 			}
 		}
@@ -796,26 +754,6 @@ public final class BuildingIndexStore {
 			ps.setLong(1, id);
 			try (ResultSet rs = ps.executeQuery()) {
 				return rs.next() ? region(rs) : null;
-			}
-		}
-	}
-
-	private int targetRatio(long regionId, String playerNameKey) throws SQLException {
-		try (PreparedStatement ps = connection.prepareStatement("SELECT ratio_bp FROM region_authors WHERE region_id = ? AND player_name_key = ?")) {
-			ps.setLong(1, regionId);
-			ps.setString(2, playerNameKey);
-			try (ResultSet rs = ps.executeQuery()) {
-				return rs.next() ? rs.getInt(1) : 0;
-			}
-		}
-	}
-
-	private String targetLastTouched(long regionId, String playerNameKey) throws SQLException {
-		try (PreparedStatement ps = connection.prepareStatement("SELECT last_touched_at FROM region_authors WHERE region_id = ? AND player_name_key = ?")) {
-			ps.setLong(1, regionId);
-			ps.setString(2, playerNameKey);
-			try (ResultSet rs = ps.executeQuery()) {
-				return rs.next() ? rs.getString(1) : null;
 			}
 		}
 	}
@@ -861,28 +799,31 @@ public final class BuildingIndexStore {
 		}
 	}
 
-	private static List<List<BlockRecord>> connectedGroups(List<BlockRecord> blocks) {
-		Map<String, BlockRecord> byKey = new HashMap<>();
+	private static List<List<BlockRecord>> connectedGroups(List<BlockRecord> blocks) throws IOException {
+		Map<BlockCoordinate, BlockRecord> byCoordinate = new HashMap<>();
 		for (BlockRecord block : blocks) {
-			byKey.put(block.coordinate().key(), block);
+			ensureNotInterrupted();
+			byCoordinate.put(block.coordinate(), block);
 		}
 		List<List<BlockRecord>> out = new ArrayList<>();
-		Set<String> visited = new HashSet<>();
-		for (String seed : byKey.keySet()) {
+		Set<BlockCoordinate> visited = new HashSet<>();
+		for (BlockCoordinate seed : byCoordinate.keySet()) {
+			ensureNotInterrupted();
 			if (visited.contains(seed)) continue;
 			List<BlockRecord> group = new ArrayList<>();
-			ArrayDeque<String> queue = new ArrayDeque<>();
+			ArrayDeque<BlockCoordinate> queue = new ArrayDeque<>();
 			queue.add(seed);
 			visited.add(seed);
 			while (!queue.isEmpty()) {
-				String key = queue.removeFirst();
-				BlockRecord record = byKey.get(key);
+				ensureNotInterrupted();
+				BlockCoordinate key = queue.removeFirst();
+				BlockRecord record = byCoordinate.get(key);
 				if (record == null) continue;
 				group.add(record);
 				BlockCoordinate coord = record.coordinate();
 				for (int[] n : NEIGHBORS) {
-					String next = coord.offset(n[0], n[1], n[2]).key();
-					if (visited.contains(next) || !byKey.containsKey(next)) continue;
+					BlockCoordinate next = coord.offset(n[0], n[1], n[2]);
+					if (visited.contains(next) || !byCoordinate.containsKey(next)) continue;
 					visited.add(next);
 					queue.add(next);
 				}
@@ -893,22 +834,24 @@ public final class BuildingIndexStore {
 		return out;
 	}
 
-	private static List<List<BlockRecord>> compactGroups(List<BlockRecord> scanned, List<List<BlockRecord>> groups) {
+	private static List<List<BlockRecord>> compactGroups(List<BlockRecord> scanned, List<List<BlockRecord>> groups) throws IOException {
 		List<MutableGroup> work = new ArrayList<>();
 		for (List<BlockRecord> group : groups) {
 			if (!group.isEmpty()) work.add(new MutableGroup(group));
 		}
 		boolean changed;
 		do {
+			ensureNotInterrupted();
 			changed = false;
 			work.sort(Comparator.comparingInt(MutableGroup::size).reversed());
 			outer:
 			for (int i = 0; i < work.size(); i++) {
+				ensureNotInterrupted();
 				for (int j = i + 1; j < work.size(); j++) {
 					MutableGroup a = work.get(i);
 					MutableGroup b = work.get(j);
 					Bounds merged = a.bounds.merge(b.bounds);
-					int mergedNonAir = blocksWithin(scanned, merged).size();
+					int mergedNonAir = countBlocksWithin(scanned, merged);
 					if (!shouldMergeGroups(a, b, merged, mergedNonAir)) continue;
 					a.merge(b);
 					work.remove(j);
@@ -921,6 +864,20 @@ public final class BuildingIndexStore {
 		List<List<BlockRecord>> out = new ArrayList<>();
 		for (MutableGroup group : work) out.add(group.blocks);
 		return out;
+	}
+
+	private static int countBlocksWithin(List<BlockRecord> blocks, Bounds bounds) {
+		int count = 0;
+		for (BlockRecord block : blocks) {
+			if (bounds.contains(block.x, block.y, block.z)) count += 1;
+		}
+		return count;
+	}
+
+	private static void ensureNotInterrupted() throws IOException {
+		if (Thread.currentThread().isInterrupted()) {
+			throw new IOException("Interrupted while preparing portability export");
+		}
 	}
 
 	private static boolean shouldMergeGroups(MutableGroup a, MutableGroup b, Bounds merged, int mergedNonAir) {
@@ -945,18 +902,6 @@ public final class BuildingIndexStore {
 		return out;
 	}
 
-	private static List<BlockRecord> filterToCoordinates(List<BlockRecord> blocks, List<BlockCoordinate> coordinates) {
-		Set<String> keys = new HashSet<>();
-		for (BlockCoordinate coordinate : coordinates) {
-			keys.add(coordinate.key());
-		}
-		List<BlockRecord> out = new ArrayList<>();
-		for (BlockRecord block : blocks) {
-			if (keys.contains(block.coordinate().key())) out.add(block);
-		}
-		return out;
-	}
-
 	private static Region region(ResultSet rs) throws SQLException {
 		return new Region(
 			rs.getLong("id"),
@@ -968,6 +913,22 @@ public final class BuildingIndexStore {
 			rs.getInt("max_y"),
 			rs.getInt("max_z"),
 			rs.getInt("non_air_count")
+		);
+	}
+
+	private static RegionExportPlan regionExportPlan(ResultSet rs) throws SQLException {
+		return new RegionExportPlan(
+			rs.getLong("id"),
+			rs.getString("dimension"),
+			rs.getInt("min_x"),
+			rs.getInt("min_y"),
+			rs.getInt("min_z"),
+			rs.getInt("max_x"),
+			rs.getInt("max_y"),
+			rs.getInt("max_z"),
+			rs.getInt("target_ratio_bp"),
+			rs.getString("target_last_touched_at"),
+			rs.getInt("author_count")
 		);
 	}
 

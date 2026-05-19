@@ -26,6 +26,11 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Async HTTP to Beilin Worker API. Network error or non-allowed => deny.
@@ -38,10 +43,10 @@ public final class BeilinApiClient {
 	private static final int BACKUP_INET_MAX_PER_DNS = 1;
 	private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
-	private final HttpClient primaryHttpClient = HttpClient.newBuilder()
-		.connectTimeout(CONNECT_TIMEOUT)
-		.build();
+	private final ExecutorService primaryExecutor;
+	private final HttpClient primaryHttpClient;
 	private final OkHttpClient backupHttpClient;
+	private final AtomicBoolean closed = new AtomicBoolean(false);
 
 	private final CommonConfig config;
 	private final OutboundRouteState outboundRouteState;
@@ -49,11 +54,24 @@ public final class BeilinApiClient {
 	public BeilinApiClient(CommonConfig config, OutboundRouteState outboundRouteState) {
 		this.config = Objects.requireNonNull(config, "config");
 		this.outboundRouteState = Objects.requireNonNull(outboundRouteState, "outboundRouteState");
+		this.primaryExecutor = Executors.newCachedThreadPool(daemonThreadFactory("beilin-entry-control-http"));
+		this.primaryHttpClient = HttpClient.newBuilder()
+			.connectTimeout(CONNECT_TIMEOUT)
+			.executor(primaryExecutor)
+			.build();
 		this.backupHttpClient = new OkHttpClient.Builder()
 			.connectTimeout(CONNECT_TIMEOUT)
 			.callTimeout(REQUEST_TIMEOUT)
 			.dns(new FixedHostDns(config.baseHost(), this::resolveStickyOrFreshBackupInet))
 			.build();
+	}
+
+	public void shutdownNow() {
+		if (!closed.compareAndSet(false, true)) return;
+		primaryExecutor.shutdownNow();
+		backupHttpClient.dispatcher().cancelAll();
+		backupHttpClient.dispatcher().executorService().shutdownNow();
+		backupHttpClient.connectionPool().evictAll();
 	}
 
 	/**
@@ -80,6 +98,9 @@ public final class BeilinApiClient {
 	}
 
 	private CompletableFuture<ApiResponse> postJson(String pathSuffix, String jsonBody) {
+		if (closed.get()) {
+			return CompletableFuture.failedFuture(new IOException("api client closed"));
+		}
 		if (!config.isValid()) {
 			return CompletableFuture.failedFuture(new IllegalStateException("config invalid"));
 		}
@@ -260,6 +281,15 @@ public final class BeilinApiClient {
 			case "EmailConfirmRequired" ->
 				"您正在尝试进入一个新的北约成员服，请查看邮件中的指引完成确认。";
 			default -> reason;
+		};
+	}
+
+	private static ThreadFactory daemonThreadFactory(String name) {
+		AtomicInteger count = new AtomicInteger();
+		return r -> {
+			Thread t = new Thread(r, name + "-" + count.incrementAndGet());
+			t.setDaemon(true);
+			return t;
 		};
 	}
 

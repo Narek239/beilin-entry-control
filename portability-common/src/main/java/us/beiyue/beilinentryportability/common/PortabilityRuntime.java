@@ -12,9 +12,15 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class PortabilityRuntime {
+	private static final long STOP_FAIL_TIMEOUT_SECONDS = 2L;
+	private static final String STOP_FAILURE_REASON = "ExportShutdown";
+
 	private final PortabilityApiClient apiClient;
 	private final CommonLogger log;
 	private final BuildingIndexStore indexStore;
@@ -29,6 +35,9 @@ public final class PortabilityRuntime {
 	private final AtomicBoolean processing = new AtomicBoolean(false);
 	private final AtomicBoolean stopped = new AtomicBoolean(false);
 	private final AtomicBoolean started = new AtomicBoolean(false);
+	private final AtomicReference<CompletableFuture<Boolean>> currentJobFuture = new AtomicReference<>();
+	private final AtomicReference<Long> currentProcessingJobId = new AtomicReference<>();
+	private final AtomicReference<Long> currentClaimedJobId = new AtomicReference<>();
 
 	public PortabilityRuntime(
 		PortabilityApiClient apiClient,
@@ -61,9 +70,23 @@ public final class PortabilityRuntime {
 	}
 
 	public void stop() {
-		stopped.set(true);
+		if (stopped.getAndSet(true)) return;
 		PortabilityBridge.removeListener(exportJobsListener);
+		pendingJobs.clear();
+		acceptedJobIds.clear();
+		Long processingJobId = currentProcessingJobId.getAndSet(null);
+		Long claimedJobId = currentClaimedJobId.getAndSet(null);
+		CompletableFuture<Boolean> future = currentJobFuture.getAndSet(null);
+		if (future != null) {
+			future.cancel(true);
+		}
+		processing.set(false);
 		scheduler.shutdownNow();
+		Long failJobId = claimedJobId != null ? claimedJobId : processingJobId;
+		if (failJobId != null) {
+			failJobDuringStop(failJobId);
+		}
+		apiClient.shutdownNow();
 	}
 
 	private void onExportJobs(List<ExportJob> jobs) {
@@ -101,7 +124,8 @@ public final class PortabilityRuntime {
 	private void processJob(ExportJob job) {
 		if (stopped.get()) return;
 		if (!processing.compareAndSet(false, true)) return;
-		apiClient.claimJobAsync(job.requestId).thenComposeAsync(claimed -> {
+		currentProcessingJobId.set(job.requestId);
+		CompletableFuture<Boolean> jobFuture = apiClient.claimJobAsync(job.requestId).thenComposeAsync(claimed -> {
 			if (stopped.get()) {
 				return CompletableFuture.completedFuture(false);
 			}
@@ -109,6 +133,7 @@ public final class PortabilityRuntime {
 				log.warn("Portability export job {} was not claimed; it may have been taken or changed state.", job.requestId);
 				return CompletableFuture.completedFuture(true);
 			}
+			currentClaimedJobId.set(job.requestId);
 			try {
 				if (stopped.get()) return CompletableFuture.completedFuture(false);
 				ExportBundle bundle = indexStore.buildExportBundle(job, worldBlockReader, maxExportVolumeBlocks);
@@ -120,11 +145,15 @@ public final class PortabilityRuntime {
 					job.requestId, artifact.path.toAbsolutePath(), artifact.bytes);
 				return apiClient.submitManifestAsync(bundle.manifest)
 					.thenCompose(ok -> {
+						if (stopped.get()) return CompletableFuture.completedFuture(false);
 						if (!ok) return CompletableFuture.completedFuture(false);
 						return apiClient.uploadArtifactAsync(job.requestId, artifact)
-							.thenCompose(upload -> apiClient.completeJobAsync(job.requestId, artifact, upload));
+							.thenCompose(upload -> stopped.get()
+								? CompletableFuture.completedFuture(false)
+								: apiClient.completeJobAsync(job.requestId, artifact, upload));
 					});
 			} catch (Exception e) {
+				if (stopped.get()) return CompletableFuture.completedFuture(false);
 				log.warn("Portability export job {} local package generation failed: {}", job.requestId, e.toString());
 				apiClient.failJobAsync(job.requestId, "PackageGenerationFailed");
 				return CompletableFuture.completedFuture(false);
@@ -140,10 +169,29 @@ public final class PortabilityRuntime {
 					apiClient.failJobAsync(job.requestId, "ExportDeliveryFailed");
 				}
 			} finally {
+				currentClaimedJobId.compareAndSet(job.requestId, null);
+				currentProcessingJobId.compareAndSet(job.requestId, null);
+				currentJobFuture.set(null);
 				acceptedJobIds.remove(job.requestId);
 				processing.set(false);
 				processNextJob();
 			}
 		}, scheduler);
+		currentJobFuture.set(jobFuture);
+		if (jobFuture.isDone()) {
+			currentJobFuture.compareAndSet(jobFuture, null);
+		}
+	}
+
+	private void failJobDuringStop(long requestId) {
+		CompletableFuture<Boolean> fail = apiClient.failJobAsync(requestId, STOP_FAILURE_REASON);
+		try {
+			fail.get(STOP_FAIL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+		} catch (TimeoutException e) {
+			fail.cancel(true);
+			log.warn("Portability export job {} shutdown failure report timed out", requestId);
+		} catch (Exception e) {
+			log.warn("Portability export job {} shutdown failure report failed: {}", requestId, e.toString());
+		}
 	}
 }

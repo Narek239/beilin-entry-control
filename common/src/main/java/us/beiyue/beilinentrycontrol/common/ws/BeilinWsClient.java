@@ -176,8 +176,15 @@ public final class BeilinWsClient {
 				w.close(NORMAL_CLOSURE, "shutdown");
 			} catch (Exception ignored) {
 			}
+			try {
+				w.cancel();
+			} catch (Exception ignored) {
+			}
 		}
 		scheduler.shutdownNow();
+		apiClient.shutdownNow();
+		shutdownOkHttp(primaryWsClient);
+		shutdownOkHttp(backupWsClient);
 	}
 
 	boolean runOnScheduler(Runnable r) {
@@ -681,6 +688,21 @@ public final class BeilinWsClient {
 			return null;
 		}
 		return o.get(key).getAsString();
+	}
+
+	private static void shutdownOkHttp(OkHttpClient client) {
+		try {
+			client.dispatcher().cancelAll();
+		} catch (Exception ignored) {
+		}
+		try {
+			client.dispatcher().executorService().shutdownNow();
+		} catch (Exception ignored) {
+		}
+		try {
+			client.connectionPool().evictAll();
+		} catch (Exception ignored) {
+		}
 	}
 
 	private void forwardExportJobsToPortabilityBridge(String text) {

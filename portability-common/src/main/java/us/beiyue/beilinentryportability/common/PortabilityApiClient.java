@@ -15,20 +15,44 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class PortabilityApiClient {
 	private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
 	private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(20);
 
 	private final CommonConfig config;
-	private final HttpClient client = HttpClient.newBuilder()
-		.connectTimeout(CONNECT_TIMEOUT)
-		.build();
+	private final ExecutorService executor;
+	private final HttpClient client;
+	private final AtomicBoolean closed = new AtomicBoolean(false);
 
 	public PortabilityApiClient(CommonConfig config) {
+		this(config, Executors.newCachedThreadPool(daemonThreadFactory("beilin-entry-portability-api")));
+	}
+
+	public PortabilityApiClient(CommonConfig config, ExecutorService executor) {
 		this.config = Objects.requireNonNull(config, "config");
+		this.executor = Objects.requireNonNull(executor, "executor");
+		this.client = HttpClient.newBuilder()
+			.connectTimeout(CONNECT_TIMEOUT)
+			.executor(executor)
+			.build();
+	}
+
+	public void shutdownNow() {
+		closed.set(true);
+		executor.shutdownNow();
 	}
 
 	public CompletableFuture<Boolean> claimJobAsync(long requestId) {
@@ -66,7 +90,7 @@ public final class PortabilityApiClient {
 
 	public CompletableFuture<ExportUploadSession> uploadArtifactAsync(long requestId, ExportArtifact artifact) {
 		return beginArtifactUploadAsync(requestId, artifact)
-			.thenCompose(session -> CompletableFuture.supplyAsync(() -> {
+			.thenCompose(session -> supplyCancelable(() -> {
 				boolean completed = false;
 				try {
 					uploadArtifactPartsBlocking(requestId, session, artifact);
@@ -76,7 +100,7 @@ public final class PortabilityApiClient {
 				} catch (Exception e) {
 					throw new CompletionException(e);
 				} finally {
-					if (!completed) {
+					if (!completed && !closed.get() && !Thread.currentThread().isInterrupted()) {
 						try {
 							abortArtifactUploadBlocking(requestId, session);
 						} catch (Exception ignored) {
@@ -121,6 +145,7 @@ public final class PortabilityApiClient {
 		int partNumber = 1;
 		try (InputStream in = Files.newInputStream(artifact.path)) {
 			while (true) {
+				throwIfCancelled();
 				int read = readPart(in, buffer);
 				if (read < 0) {
 					break;
@@ -134,6 +159,7 @@ public final class PortabilityApiClient {
 	private void uploadArtifactPartWithRetry(long requestId, long uploadId, int partNumber, byte[] buffer, int length) throws IOException, InterruptedException {
 		IOException last = null;
 		for (int attempt = 1; attempt <= 3; attempt += 1) {
+			throwIfCancelled();
 			try {
 				ApiResponse response = putBytesBlocking(
 					"/exports/" + requestId + "/artifact/uploads/" + uploadId + "/parts/" + partNumber,
@@ -181,6 +207,9 @@ public final class PortabilityApiClient {
 	}
 
 	private CompletableFuture<ApiResponse> postJson(String pathSuffix, String body) {
+		if (closed.get()) {
+			return CompletableFuture.failedFuture(new CancellationException("api client closed"));
+		}
 		if (!config.isValid()) {
 			return CompletableFuture.failedFuture(new IllegalStateException("config invalid"));
 		}
@@ -199,6 +228,7 @@ public final class PortabilityApiClient {
 	}
 
 	private ApiResponse postJsonBlocking(String pathSuffix, String body) throws IOException, InterruptedException {
+		throwIfCancelled();
 		if (!config.isValid()) {
 			throw new IOException("config invalid");
 		}
@@ -221,6 +251,7 @@ public final class PortabilityApiClient {
 	}
 
 	private ApiResponse putBytesBlocking(String pathSuffix, byte[] buffer, int length) throws IOException, InterruptedException {
+		throwIfCancelled();
 		if (!config.isValid()) {
 			throw new IOException("config invalid");
 		}
@@ -280,8 +311,57 @@ public final class PortabilityApiClient {
 		return offset;
 	}
 
+	private <T> CompletableFuture<T> supplyCancelable(Callable<T> task) {
+		AtomicReference<Future<?>> futureRef = new AtomicReference<>();
+		CompletableFuture<T> result = new CompletableFuture<>() {
+			@Override
+			public boolean cancel(boolean mayInterruptIfRunning) {
+				Future<?> future = futureRef.get();
+				if (future != null) {
+					future.cancel(mayInterruptIfRunning);
+				}
+				return super.cancel(mayInterruptIfRunning);
+			}
+		};
+		try {
+			Future<?> future = executor.submit(() -> {
+				if (result.isCancelled()) return;
+				try {
+					result.complete(task.call());
+				} catch (CancellationException e) {
+					result.cancel(false);
+				} catch (Throwable t) {
+					result.completeExceptionally(t);
+				}
+			});
+			futureRef.set(future);
+			if (result.isCancelled()) {
+				future.cancel(true);
+			}
+		} catch (RejectedExecutionException e) {
+			result.completeExceptionally(e);
+		}
+		return result;
+	}
+
+	private void throwIfCancelled() throws InterruptedException {
+		if (closed.get() || Thread.currentThread().isInterrupted()) {
+			Thread.currentThread().interrupt();
+			throw new InterruptedException("portability api client closed");
+		}
+	}
+
 	private static String escapeJson(String s) {
 		return s.replace("\\", "\\\\").replace("\"", "\\\"");
+	}
+
+	private static ThreadFactory daemonThreadFactory(String name) {
+		AtomicInteger count = new AtomicInteger();
+		return r -> {
+			Thread t = new Thread(r, name + "-" + count.incrementAndGet());
+			t.setDaemon(true);
+			return t;
+		};
 	}
 
 	private static final class ApiResponse {

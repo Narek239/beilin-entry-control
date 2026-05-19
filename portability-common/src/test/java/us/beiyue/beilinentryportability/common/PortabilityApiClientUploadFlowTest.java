@@ -25,9 +25,10 @@ public final class PortabilityApiClientUploadFlowTest {
 		server.createContext("/", exchange -> handle(exchange, calls, partTwoAttempts));
 		server.start();
 		Path artifactPath = null;
+		PortabilityApiClient client = null;
 		try {
 			int port = server.getAddress().getPort();
-			PortabilityApiClient client = new PortabilityApiClient(new TestConfig(port));
+			client = new PortabilityApiClient(new TestConfig(port));
 			artifactPath = Files.createTempFile("beilin-entry-portability-upload", ".zip");
 			Files.writeString(artifactPath, "hello-world", StandardCharsets.UTF_8);
 			ExportArtifact artifact = new ExportArtifact(artifactPath, Files.size(artifactPath), SHA);
@@ -58,6 +59,9 @@ public final class PortabilityApiClientUploadFlowTest {
 		} finally {
 			if (artifactPath != null) {
 				Files.deleteIfExists(artifactPath);
+			}
+			if (client != null) {
+				client.shutdownNow();
 			}
 			server.stop(0);
 		}

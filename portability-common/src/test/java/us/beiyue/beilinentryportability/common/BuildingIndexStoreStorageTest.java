@@ -11,16 +11,20 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.regex.Pattern;
 
 public final class BuildingIndexStoreStorageTest {
+	private static final Pattern SQLITE_UTC_DATETIME = Pattern.compile("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}");
+
 	public static void main(String[] args) throws Exception {
 		Class.forName("org.sqlite.JDBC");
 		Path dir = Files.createTempDirectory("beilin-entry-portability-storage");
+		BuildingIndexStore store = null;
 		try {
 			Path db = dir.resolve("world.db");
 			createOldSchemaMarker(db);
 
-			BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+			store = BuildingIndexStore.open(db, new NoopLogger());
 			store.recordPlaced("minecraft:overworld", 0, 64, 0, "minecraft:stone", "Alice");
 			store.recordPlaced("minecraft:overworld", 1, 64, 0, "minecraft:oak_planks", "Bob");
 			store.recordStateChangeWithSource("minecraft:overworld", 2, 64, 0, "minecraft:air", "minecraft:glass", "ALICE", "PLAYER_USE_ITEM_ON");
@@ -31,11 +35,16 @@ public final class BuildingIndexStoreStorageTest {
 			store.recordPlaced("minecraft:overworld", 7, 64, 0, "minecraft:stone", "Alice");
 			store.recordStateChangeWithSource("minecraft:overworld", 3, 64, 0, "minecraft:air", "minecraft:lantern", "SYSTEM", "SYSTEM_SET_BLOCK");
 			store.recordStateChangeWithSource("minecraft:overworld", 8, 64, 0, "minecraft:air", "minecraft:wall_torch", "UNKNOWN", "SYSTEM_SET_BLOCK");
+			store.close();
+			store = null;
+
 			insertLongRailRegion(db);
+			store = BuildingIndexStore.open(db, new NoopLogger());
+			FakeWorldReader reader = new FakeWorldReader();
 
 			ExportBundle bundle = store.buildExportBundle(
 				new ExportJob(42L, "alice", null, null),
-				new FakeWorldReader(),
+				reader,
 				1_000_000
 			);
 			assertEquals(1, bundle.components.size(), "long rail should be excluded and compact building should export");
@@ -46,21 +55,38 @@ public final class BuildingIndexStoreStorageTest {
 			assertEquals(8750, summary.targetAuthorRatioBp, "username ratio should be normalized and author-only");
 			assertEquals("mixed_authorship", summary.riskFlags, "multi-author region should be flagged");
 			assertEquals("beilin-entry-portability-manifest-v2", bundle.manifest.toManifestJson().get("format").getAsString(), "manifest format");
+			assertEquals(0, reader.scanCalls, "export should use exact coordinate reads instead of cuboid scans");
+			assertTrue(reader.coordinateReadCalls > 0, "exact coordinate reader should be used");
+			assertSqliteUtcDatetime(bundle.manifest.generatedAt, "manifest generated_at should use SQLite UTC datetime");
+			assertSqliteUtcDatetime(summary.targetLastTouchedAt, "component target_last_touched_at should use SQLite UTC datetime");
 			store.close();
+			store = null;
 
 			try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
 				 Statement s = c.createStatement()) {
 				assertEquals("wal", scalarString(s, "PRAGMA journal_mode"), "SQLite journal mode should be WAL");
-				assertEquals(6, scalarInt(s, "PRAGMA user_version"), "schema version should be v6");
-				assertFalse(tableExists(s, "current_blocks"), "old per-block table should be dropped");
+				assertEquals(7, scalarInt(s, "PRAGMA user_version"), "schema version should be v7");
+				assertTrue(tableExists(s, "current_blocks"), "old per-block table should be retained during non-destructive migration");
 				assertFalse(tableExists(s, "block_events"), "change log table should not exist");
 				assertTrue(tableExists(s, "building_regions"), "v5 region table should exist");
 				assertTrue(tableExists(s, "region_authors"), "v5 author table should exist");
 				assertTrue(tableExists(s, "region_blocks"), "v6 placed block table should exist");
-				assertTrue(tableExists(s, "region_chunk_index"), "v5 chunk index table should exist");
+				assertFalse(tableExists(s, "region_chunk_index"), "unused chunk index table should not be created for new schemas");
 				assertEquals(2, scalarInt(s, "SELECT COUNT(DISTINCT player_name_key) FROM region_authors WHERE player_name_key IN ('alice','bob')"), "authors should be keyed by normalized username");
+				assertEquals(0, scalarInt(s, """
+					SELECT COUNT(*) FROM building_regions
+					WHERE created_at LIKE '%T%' OR updated_at LIKE '%T%' OR last_touched_at LIKE '%T%'
+					"""), "building region datetimes should be normalized");
+				assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_authors WHERE last_touched_at LIKE '%T%'"), "author datetimes should be normalized");
+				assertEquals(0, scalarInt(s, """
+					SELECT COUNT(*) FROM region_blocks
+					WHERE first_placed_at LIKE '%T%' OR last_touched_at LIKE '%T%'
+					"""), "placed block datetimes should be normalized");
 			}
 		} finally {
+			if (store != null) {
+				store.close();
+			}
 			deleteTree(dir);
 		}
 	}
@@ -148,6 +174,12 @@ public final class BuildingIndexStoreStorageTest {
 		if (value) throw new AssertionError(message);
 	}
 
+	private static void assertSqliteUtcDatetime(String value, String message) {
+		if (value == null || !SQLITE_UTC_DATETIME.matcher(value).matches()) {
+			throw new AssertionError(message + ": " + value);
+		}
+	}
+
 	private static void deleteTree(Path dir) throws Exception {
 		if (!Files.exists(dir)) return;
 		try (var paths = Files.walk(dir)) {
@@ -158,43 +190,48 @@ public final class BuildingIndexStoreStorageTest {
 	}
 
 	private static final class FakeWorldReader implements WorldBlockReader {
+		int scanCalls;
+		int coordinateReadCalls;
+
 		@Override
 		public List<BlockRecord> scan(String dimension, int minX, int minY, int minZ, int maxX, int maxY, int maxZ, int maxVolumeBlocks) {
+			scanCalls++;
+			throw new AssertionError("unexpected cuboid scan");
+		}
+
+		@Override
+		public List<BlockRecord> readCoordinates(String dimension, List<BlockCoordinate> coordinates, int maxExportVolumeBlocks) {
+			coordinateReadCalls++;
 			List<BlockRecord> blocks = new ArrayList<>();
-			if (minX >= 100) {
-				for (int x = 100; x <= 140; x++) {
-					blocks.add(new BlockRecord(dimension, x, 64, 0, "minecraft:rail"));
+			for (BlockCoordinate coordinate : coordinates) {
+				if (coordinate.x >= 100 && coordinate.x <= 140 && coordinate.y == 64 && coordinate.z == 0) {
+					blocks.add(new BlockRecord(dimension, coordinate.x, coordinate.y, coordinate.z, "minecraft:rail"));
+					continue;
 				}
-				return blocks;
+				addKnownBlock(blocks, dimension, coordinate);
 			}
-			addIfInside(blocks, dimension, 0, 64, 0, "minecraft:stone", minX, minY, minZ, maxX, maxY, maxZ);
-			addIfInside(blocks, dimension, 1, 64, 0, "minecraft:oak_planks", minX, minY, minZ, maxX, maxY, maxZ);
-			addIfInside(blocks, dimension, 2, 64, 0, "minecraft:glass", minX, minY, minZ, maxX, maxY, maxZ);
-			addIfInside(blocks, dimension, 3, 64, 0, "minecraft:stone", minX, minY, minZ, maxX, maxY, maxZ);
-			addIfInside(blocks, dimension, 4, 64, 0, "minecraft:stone", minX, minY, minZ, maxX, maxY, maxZ);
-			addIfInside(blocks, dimension, 5, 64, 0, "minecraft:stone", minX, minY, minZ, maxX, maxY, maxZ);
-			addIfInside(blocks, dimension, 6, 64, 0, "minecraft:stone", minX, minY, minZ, maxX, maxY, maxZ);
-			addIfInside(blocks, dimension, 7, 64, 0, "minecraft:stone", minX, minY, minZ, maxX, maxY, maxZ);
-			addIfInside(blocks, dimension, 8, 64, 0, "minecraft:wall_torch", minX, minY, minZ, maxX, maxY, maxZ);
+			blocks.sort(Comparator
+				.comparingInt((BlockRecord b) -> b.y)
+				.thenComparingInt(b -> b.z)
+				.thenComparingInt(b -> b.x));
 			return blocks;
 		}
 
-		private static void addIfInside(
+		private static void addKnownBlock(
 			List<BlockRecord> blocks,
 			String dimension,
-			int x,
-			int y,
-			int z,
-			String blockState,
-			int minX,
-			int minY,
-			int minZ,
-			int maxX,
-			int maxY,
-			int maxZ
+			BlockCoordinate coordinate
 		) {
-			if (x < minX || x > maxX || y < minY || y > maxY || z < minZ || z > maxZ) return;
-			blocks.add(new BlockRecord(dimension, x, y, z, blockState));
+			if (coordinate.y != 64 || coordinate.z != 0) return;
+			switch (coordinate.x) {
+				case 0 -> blocks.add(new BlockRecord(dimension, 0, 64, 0, "minecraft:stone"));
+				case 1 -> blocks.add(new BlockRecord(dimension, 1, 64, 0, "minecraft:oak_planks"));
+				case 2 -> blocks.add(new BlockRecord(dimension, 2, 64, 0, "minecraft:glass"));
+				case 3, 4, 5, 6, 7 -> blocks.add(new BlockRecord(dimension, coordinate.x, 64, 0, "minecraft:stone"));
+				case 8 -> blocks.add(new BlockRecord(dimension, 8, 64, 0, "minecraft:wall_torch"));
+				default -> {
+				}
+			}
 		}
 	}
 
