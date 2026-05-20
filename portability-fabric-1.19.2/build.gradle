@@ -4,7 +4,7 @@ plugins {
 }
 
 base {
-	archivesName = "beilin-entry-portability-fabric-1.19.2"
+	archivesName = "beilin-data-portability-fabric-1.19.2"
 }
 
 java {
@@ -21,7 +21,7 @@ tasks.withType(JavaCompile).configureEach {
 loom {
 	splitEnvironmentSourceSets()
 	mods {
-		"beilin-entry-portability" {
+		"beilin-data-portability" {
 			sourceSet sourceSets.main
 			sourceSet sourceSets.client
 		}
@@ -52,7 +52,7 @@ processResources {
 publishing {
 	publications {
 		create("mavenJava", MavenPublication) {
-			artifactId = "beilin-entry-portability-fabric-1.19.2"
+			artifactId = "beilin-data-portability-fabric-1.19.2"
 			from components.java
 		}
 	}

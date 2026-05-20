@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "id": "beilin-entry-portability",
+  "id": "beilin-data-portability",
   "version": "${version}",
-  "name": "Beilin Entry Portability",
+  "name": "Beilin Data Portability",
   "description": "Data portability export addon for Beilin Entry Control",
   "authors": [
     "Me!"
@@ -11,11 +11,11 @@
   "environment": "server",
   "entrypoints": {
     "main": [
-      "us.beiyue.beilinentryportability.platform.fabric1192.BeilinEntryPortability1192"
+      "us.beiyue.beilindataportability.platform.fabric1192.BeilinDataPortability1192"
     ]
   },
   "mixins": [
-    "beilin-entry-portability-1192.mixins.json"
+    "beilin-data-portability-1192.mixins.json"
   ],
   "depends": {
     "fabricloader": ">=0.18.4",

@@ -707,7 +707,7 @@ public final class BeilinWsClient {
 
 	private void forwardExportJobsToPortabilityBridge(String text) {
 		try {
-			Class<?> bridge = Class.forName("us.beiyue.beilinentryportability.common.PortabilityBridge");
+			Class<?> bridge = Class.forName("us.beiyue.beilindataportability.common.PortabilityBridge");
 			Method accept = bridge.getMethod("acceptExportJobsJson", String.class);
 			accept.invoke(null, text);
 			Method count = bridge.getMethod("listenerCount");

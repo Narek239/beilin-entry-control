@@ -26,31 +26,31 @@ tasks.named("test", Test) {
 tasks.register("uploadFlowTest", JavaExec) {
 	dependsOn tasks.named("testClasses")
 	classpath = sourceSets.test.runtimeClasspath
-	mainClass = "us.beiyue.beilinentryportability.common.PortabilityApiClientUploadFlowTest"
+	mainClass = "us.beiyue.beilindataportability.common.PortabilityApiClientUploadFlowTest"
 }
 
 tasks.register("storageTest", JavaExec) {
 	dependsOn tasks.named("testClasses")
 	classpath = sourceSets.test.runtimeClasspath
-	mainClass = "us.beiyue.beilinentryportability.common.BuildingIndexStoreStorageTest"
+	mainClass = "us.beiyue.beilindataportability.common.BuildingIndexStoreStorageTest"
 }
 
 tasks.register("litematicRoundTripTest", JavaExec) {
 	dependsOn tasks.named("testClasses")
 	classpath = sourceSets.test.runtimeClasspath
-	mainClass = "us.beiyue.beilinentryportability.common.LitematicWriterRoundTripTest"
+	mainClass = "us.beiyue.beilindataportability.common.LitematicWriterRoundTripTest"
 }
 
 tasks.register("portabilityBridgeDispatchTest", JavaExec) {
 	dependsOn tasks.named("testClasses")
 	classpath = sourceSets.test.runtimeClasspath
-	mainClass = "us.beiyue.beilinentryportability.common.PortabilityBridgeDispatchTest"
+	mainClass = "us.beiyue.beilindataportability.common.PortabilityBridgeDispatchTest"
 }
 
 tasks.register("runtimeStopTest", JavaExec) {
 	dependsOn tasks.named("testClasses")
 	classpath = sourceSets.test.runtimeClasspath
-	mainClass = "us.beiyue.beilinentryportability.common.PortabilityRuntimeStopTest"
+	mainClass = "us.beiyue.beilindataportability.common.PortabilityRuntimeStopTest"
 }
 
 tasks.named("check") {
@@ -64,7 +64,7 @@ tasks.named("check") {
 publishing {
 	publications {
 		create("mavenJava", MavenPublication) {
-			artifactId = "beilin-entry-portability-common"
+			artifactId = "beilin-data-portability-common"
 			from components.java
 		}
 	}
