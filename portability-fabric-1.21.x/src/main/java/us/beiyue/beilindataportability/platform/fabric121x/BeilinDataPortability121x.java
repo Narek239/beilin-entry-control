@@ -70,7 +70,6 @@ public final class BeilinDataPortability121x implements ModInitializer {
 					new Slf4jCommonLogger(LOGGER),
 					indexStore,
 					new FabricWorldBlockReader121x(server, addonConfig.scanChunksPerTick),
-					addonConfig.claimJobs,
 					artifactDir,
 					addonConfig.maxExportVolumeBlocks
 				);
@@ -93,14 +92,6 @@ public final class BeilinDataPortability121x implements ModInitializer {
 		activeStore = null;
 	}
 
-	public static void flushIndexForWorldSave() {
-	}
-
-	public static void checkpointIndexAfterWorldSave() {
-		// WAL is kept inside the world directory. Avoid checkpointing on the server
-		// thread after each save because large saves can otherwise make stop hang.
-	}
-
 	private static Path resolveArtifactDir(String configured) {
 		Path raw = configured != null && !configured.isBlank()
 			? Path.of(configured)
@@ -117,13 +108,12 @@ public final class BeilinDataPortability121x implements ModInitializer {
 
 	private static void registerCommands() {
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> dispatcher.register(
-			Commands.literal("beportability")
-				.requires(source -> source.hasPermission(3))
-				.then(Commands.literal("status").executes(ctx -> sendStatus(ctx.getSource())))
-				.then(Commands.literal("doctor").executes(ctx -> sendStatus(ctx.getSource())))
-				.then(Commands.literal("checkpoint").executes(ctx -> runStoreCommand(ctx.getSource(), "checkpoint")))
-				.then(Commands.literal("compact").executes(ctx -> runStoreCommand(ctx.getSource(), "compact")))
-		));
+				Commands.literal("beportability")
+					.requires(source -> source.hasPermission(3))
+					.then(Commands.literal("status").executes(ctx -> sendStatus(ctx.getSource())))
+					.then(Commands.literal("checkpoint").executes(ctx -> runStoreCommand(ctx.getSource(), "checkpoint")))
+					.then(Commands.literal("compact").executes(ctx -> runStoreCommand(ctx.getSource(), "compact")))
+			));
 	}
 
 	private static int sendStatus(CommandSourceStack source) {

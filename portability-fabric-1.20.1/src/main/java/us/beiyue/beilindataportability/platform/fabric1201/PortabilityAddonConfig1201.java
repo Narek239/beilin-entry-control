@@ -17,7 +17,6 @@ public final class PortabilityAddonConfig1201 {
 
 	public boolean exportProcessingEnabled = true;
 	public boolean recordingEnabled = true;
-	public boolean claimJobs = true;
 	public String artifactDirectory = "beilin-data-portability-exports";
 	public int maxExportVolumeBlocks = 4_000_000;
 	public int scanChunksPerTick = 12;

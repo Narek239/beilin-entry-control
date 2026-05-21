@@ -25,7 +25,6 @@ public final class PortabilityRuntime {
 	private final CommonLogger log;
 	private final BuildingIndexStore indexStore;
 	private final WorldBlockReader worldBlockReader;
-	private final boolean claimJobs;
 	private final Path artifactDir;
 	private final int maxExportVolumeBlocks;
 	private final ScheduledExecutorService scheduler;
@@ -44,7 +43,6 @@ public final class PortabilityRuntime {
 		CommonLogger log,
 		BuildingIndexStore indexStore,
 		WorldBlockReader worldBlockReader,
-		boolean claimJobs,
 		Path artifactDir,
 		int maxExportVolumeBlocks
 	) {
@@ -52,7 +50,6 @@ public final class PortabilityRuntime {
 		this.log = log;
 		this.indexStore = indexStore;
 		this.worldBlockReader = worldBlockReader;
-		this.claimJobs = claimJobs;
 		this.artifactDir = artifactDir;
 		this.maxExportVolumeBlocks = Math.max(1, maxExportVolumeBlocks);
 		this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -94,7 +91,7 @@ public final class PortabilityRuntime {
 		try {
 			scheduler.execute(() -> {
 				if (stopped.get()) return;
-				if (!claimJobs || indexStore == null) {
+				if (indexStore == null) {
 					log.info("Portability export queue has {} pending job(s)", jobs.size());
 					return;
 				}

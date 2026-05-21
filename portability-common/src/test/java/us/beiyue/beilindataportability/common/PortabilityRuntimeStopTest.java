@@ -45,7 +45,6 @@ public final class PortabilityRuntimeStopTest {
 				new NoopLogger(),
 				store,
 				new ExactReader(),
-				true,
 				dir.resolve("artifacts"),
 				1_000_000
 			);
