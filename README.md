@@ -2,20 +2,25 @@
 
 Beilin Entry Control 配套的 Fabric 服务端模组，面向 **北约成员服**。本模组通过与 beiyue.us 通信校验玩家权限、验证北约入服权。
 
+本仓库同时包含 Beilin Data Portability 附属模组。若需要建筑数据导出功能，请另见 `README-portability.md`。
+
 ---
 
 ### 功能概览
 
-- **统一入服控制**  
+- **统一入服控制**\
   玩家进入服务器时，模组会向 `beiyue.us` 发起权限校验请求。若玩家未获批北约入服权，或存在一项/多项禁令，服务器将拒绝进入。
 
-- **跨服禁令即时生效**  
+- **跨服禁令即时生效**\
   模组通过 **WebSocket** 持续同步状态。即使玩家已进入服务器，一旦权限变化相关限制也会立即生效。
 
-- **无持久化副作用**  
-  - 所有逻辑仅在内存中运行；  
-  - 仅读取本模组自身的配置文件；  
-  - 不会修改其他模组或 Minecraft 的配置；  
+- **网络高可用保障**\
+  系统采用 **主从节点架构** 保障状态同步稳定性。WebSocket 主路径异常时，模组会自动切换至备用路径；若主、备路径同时失联，服务器将判定同步失效并清理所有在线玩家，确保禁令一旦下达立即生效。
+
+- **无持久化副作用**
+  - 所有逻辑仅在内存中运行；
+  - 仅读取本模组自身的配置文件；
+  - 不会修改其他模组或 Minecraft 的配置；
   - 移除本模组后，服务器将立即恢复为原版逻辑。
 
 ---
@@ -24,13 +29,13 @@ Beilin Entry Control 配套的 Fabric 服务端模组，面向 **北约成员服
 
 在安装和使用本模组之前，请确保满足以下条件：
 
-- **北约成员服务器身份**  
+- **北约成员服务器身份**\
   本模组仅对北约成员服务器开放使用权限，非成员服务器暂不提供支持。
 
-- **Minecraft 服务端环境**  
+- **Minecraft 服务端环境**\
   服务器需运行 **Fabric 服务端**，并已正确安装 **Fabric API**，以确保模组能够正常加载和运行。
 
-- **API 凭据获取**  
+- **API 凭据获取**\
   该模组需要有效的 API 凭据。请向 Narek 获取专用的 `apiKey`，并按照配置说明将其添加至服务器配置文件中。
 
 ---
@@ -59,6 +64,8 @@ Beilin Entry Control 配套的 Fabric 服务端模组，面向 **北约成员服
 {
   "apiKey": "YOUR_API_KEY_HERE",
   "baseHost": "beiyue.us",
+  "wsBackupDnsHost": "saas.wiki-beilin.org",
+  "wsPrimaryProbeIntervalSec": 10,
   "useHttps": true,
   "useWss": true
 }
@@ -73,6 +80,16 @@ Beilin Entry Control 配套的 Fabric 服务端模组，面向 **北约成员服
   - 与 API 通信的主机名；
   - 默认值为 `"beiyue.us"`；
   - 仅在特殊环境（如内网、测试环境）需要修改。
+
+- **`wsBackupDnsHost`**
+  - WebSocket 备用路径使用的 DNS 主机名；
+  - 默认值为 `"saas.wiki-beilin.org"`；
+  - 仅在特殊环境（如内网、测试环境）需要修改。
+
+- **`wsPrimaryProbeIntervalSec`**
+  - 当 WebSocket 处于备用路径时，探测主路径恢复的间隔秒数；
+  - 默认值为 `10`；
+  - 通常无需修改。
 
 - **`useHttps`**
   - 是否通过 `https://` 访问 HTTP API；
@@ -97,7 +114,17 @@ Beilin Entry Control 配套的 Fabric 服务端模组，面向 **北约成员服
 
 - 若仍需 **配合原版白名单一起使用**：
   - 也可以保留白名单开启状态；
-  - 此时入服需要同时满足「持有有效的北林入服权」与「在服务器白名单中」两个条件。
+  - 此时入服需要同时满足「持有有效的北约入服权」与「在服务器白名单中」两个条件。
+
+---
+
+### 与 Portability 附属模组共存
+
+Beilin Data Portability 是本仓库中的附属模组，用于建筑数据可携带导出。它会复用 Beilin Entry Control 的 API 凭据和 WebSocket 推送通道，但不会替代入服控制逻辑。
+
+- 若只需要统一入服控制，仅安装 Beilin Entry Control 即可。
+- 若需要建筑导出功能，请同时安装 Beilin Entry Control 与 Beilin Data Portability。
+- Portability 的配置、索引存储、导出流程与运维命令请查看 `README-portability.md`。
 
 ---
 
@@ -115,7 +142,7 @@ Beilin Entry Control 配套的 Fabric 服务端模组，面向 **北约成员服
   - 重新启动服务器；
   - 此时服务器将恢复为 **原版入服逻辑**，不再访问 beiyue.us API。
 
-> 提示：如不再使用本模组，可根据需要手动删除 `config/beilin-entry-control.json`，这不会影响其他配置或存档。
+> 提示：如不再使用本模组，可根据需要手动删除 `config/beilin-entry-control.json`，这不会影响其他配置或存档。若服务器同时安装了 Beilin Data Portability，请一并参考 `README-portability.md` 中的移除说明。
 
 ---
 
@@ -123,6 +150,7 @@ Beilin Entry Control 配套的 Fabric 服务端模组，面向 **北约成员服
 
 - 本模组仅在内存中处理入服逻辑与事件，不主动写入任何数据文件。
 - 不会修改其他模组或 Minecraft 的配置文件，也不会改动世界存档结构。
-- 所有与 beiyue.us 的通信仅围绕入服控制相关接口进行。
+- 所有与 beiyue.us 的通信仅围绕入服控制、状态同步和导出任务推送相关接口进行。
+- 本模组会为 Beilin Data Portability 转发导出任务推送，但不会自行记录建筑数据或生成导出文件。
 
 如有任何其他疑问，请联系 Narek。
