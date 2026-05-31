@@ -3,11 +3,11 @@
   "id": "beilin-entry-control",
   "version": "${version}",
   "name": "Beilin Entry Control",
-  "description": "Server entry control via Beilin API/WS",
+  "description": "A Fabric server-side mod for Beilin Entry Control, designed for Beiyue member servers.",
   "authors": [
-    "Me!"
+    "Narek239"
   ],
-  "license": "CC0-1.0",
+  "license": "MIT",
   "environment": "*",
   "entrypoints": {
     "main": [

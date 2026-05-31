@@ -3,11 +3,11 @@
   "id": "beilin-data-portability",
   "version": "${version}",
   "name": "Beilin Data Portability",
-  "description": "Data portability export addon for Beilin Entry Control",
+  "description": "A Fabric server-side addon for Beilin Entry Control that provides building data portability exports for Beiyue member servers.",
   "authors": [
-    "Me!"
+    "Narek239"
   ],
-  "license": "CC0-1.0",
+  "license": "MIT",
   "environment": "server",
   "entrypoints": {
     "main": [
