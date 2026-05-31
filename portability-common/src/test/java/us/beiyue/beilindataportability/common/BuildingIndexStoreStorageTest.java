@@ -47,13 +47,16 @@ public final class BuildingIndexStoreStorageTest {
 				reader,
 				1_000_000
 			);
-			assertEquals(1, bundle.components.size(), "long rail should be excluded and compact building should export");
-			ComponentSummary summary = bundle.components.get(0).summary;
+				assertEquals(2, bundle.components.size(), "long rail should export once indexed; linear filtering happens only at bulk write time");
+				ComponentSummary summary = findComponent(bundle, 0);
+				ComponentSummary rail = findComponent(bundle, 100);
 			assertEquals(8, summary.nonAirBlocks, "SYSTEM/UNKNOWN changes outside the region should not expand into terrain");
 			assertEquals(8, summary.blockCount, "compat block count should map to non-air blocks");
 			assertEquals(2, summary.authorCount, "SYSTEM changes should not count as authors");
-			assertEquals(8750, summary.targetAuthorRatioBp, "username ratio should be normalized and author-only");
-			assertEquals("mixed_authorship", summary.riskFlags, "multi-author region should be flagged");
+				assertEquals(8750, summary.targetAuthorRatioBp, "username ratio should be normalized and author-only");
+				assertEquals("mixed_authorship", summary.riskFlags, "multi-author region should be flagged");
+				assertEquals(41, rail.nonAirBlocks, "indexed long rail should no longer be skipped at export time");
+				assertEquals(null, rail.riskFlags, "manifest should not claim linear components were excluded");
 			assertEquals("beilin-data-portability-manifest-v2", bundle.manifest.toManifestJson().get("format").getAsString(), "manifest format");
 			assertEquals(0, reader.scanCalls, "export should use exact coordinate reads instead of cuboid scans");
 			assertTrue(reader.coordinateReadCalls > 0, "exact coordinate reader should be used");
@@ -82,13 +85,133 @@ public final class BuildingIndexStoreStorageTest {
 					SELECT COUNT(*) FROM region_blocks
 					WHERE first_placed_at LIKE '%T%' OR last_touched_at LIKE '%T%'
 					"""), "placed block datetimes should be normalized");
-			}
+				}
+				assertRecordingSemantics(dir);
+				assertBoundsDeletion(dir);
+				assertNonLinearBoundsDeletion(dir);
+				assertGeometryClassifier();
 		} finally {
 			if (store != null) {
 				store.close();
 			}
 			deleteTree(dir);
 		}
+	}
+
+	private static void assertRecordingSemantics(Path dir) throws Exception {
+		Path db = dir.resolve("recording.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			store.recordStateChangeWithSource("minecraft:overworld", 0, 64, 0, "minecraft:grass", true, "minecraft:oak_planks", "Alice", "PLAYER_USE_ITEM_ON");
+			store.recordStateChangeWithSource("minecraft:overworld", 1, 64, 0, "minecraft:stone", false, "minecraft:oak_planks", "Alice", "PLAYER_USE_ITEM_ON");
+			try (ActorContext.Scope scope = ActorContext.pushBulkRecord("Alice", "WORLDEDIT_SET", actor ->
+				store.recordBulkStateChanges(actor.bulkChanges(), actor.name, actor.source)
+			)) {
+				ActorContext.current().addBulkChange(new BulkBlockChange(
+					"minecraft:overworld",
+					2,
+					64,
+					0,
+					"minecraft:stone",
+					"minecraft:oak_planks",
+					false,
+					true
+				));
+			}
+			store.recordPlaced("minecraft:overworld", 3, 64, 0, "minecraft:stone", "Alice");
+			store.recordPlaced("minecraft:overworld", 4, 64, 0, "minecraft:stone", "Alice");
+			try (ActorContext.Scope scope = ActorContext.pushBulkDeleteBounds(
+				"Alice",
+				"WORLDEDIT_SET",
+				new BulkPlacementBounds("minecraft:overworld", 3, 64, 0, 3, 64, 0, 1),
+				actor -> store.deleteIndexedBlocksInBounds(actor.bulkBounds(), actor.name, actor.source)
+			)) {
+				ActorContext.current().addBulkChange(new BulkBlockChange(
+					"minecraft:overworld",
+					5,
+					64,
+					0,
+					"minecraft:air",
+					"minecraft:oak_planks",
+					false,
+					true
+				));
+			}
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(3, scalarInt(s, "SELECT COUNT(*) FROM region_blocks"), "replaceable and bulk forced placements should be recorded, with delete-bounds applied");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 0"), "replaceable non-air should count as first placement");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 1"), "non-replaceable non-air replacement should not count as first placement");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 2"), "bulk RECORD should flush collected coordinates");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 3"), "bulk DELETE_BOUNDS should remove indexed coordinates in range");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 4"), "bulk DELETE_BOUNDS should keep coordinates outside range");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 5"), "bulk DELETE_BOUNDS should not collect coordinates");
+		}
+	}
+
+	private static void assertBoundsDeletion(Path dir) throws Exception {
+		Path db = dir.resolve("bounds-delete.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			store.recordPlaced("minecraft:overworld", 10, 64, 0, "minecraft:stone", "Alice");
+			store.recordPlaced("minecraft:overworld", 11, 64, 0, "minecraft:stone", "Alice");
+			store.recordPlaced("minecraft:overworld", 12, 64, 0, "minecraft:stone", "Alice");
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			s.executeUpdate("UPDATE building_regions SET dirty = 0");
+		}
+		store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			store.deleteIndexedBlocksInBounds(
+				new BulkPlacementBounds("minecraft:overworld", 10, 64, 0, 11, 64, 0, 2),
+				"Alice",
+				"WORLDEDIT_CUT"
+			);
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x BETWEEN 10 AND 11"), "bounds delete should remove indexed blocks inside range");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 12"), "bounds delete should preserve indexed blocks outside range");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM building_regions WHERE dirty = 1"), "bounds delete should mark affected region dirty");
+		}
+	}
+
+	private static void assertNonLinearBoundsDeletion(Path dir) throws Exception {
+		Path db = dir.resolve("non-linear-bounds-delete.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			store.recordPlaced("minecraft:overworld", 20, 64, 0, "minecraft:stone", "Alice");
+			store.recordPlaced("minecraft:overworld", 39, 64, 19, "minecraft:stone", "Alice");
+			store.recordPlaced("minecraft:overworld", 40, 64, 20, "minecraft:stone", "Alice");
+			store.deleteIndexedBlocksInBounds(
+				new BulkPlacementBounds("minecraft:overworld", 20, 64, 0, 39, 64, 19, 400),
+				"Alice",
+				"EFFORTLESS_BREAK"
+			);
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x BETWEEN 20 AND 39 AND z BETWEEN 0 AND 19"), "non-linear bounds delete should not depend on linear geometry");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 40 AND z = 20"), "non-linear bounds delete should preserve indexed blocks outside range");
+		}
+	}
+
+	private static void assertGeometryClassifier() {
+		assertTrue(PortabilityGeometryClassifier.isLinearInfrastructureBySize(1000, 1, 1, 1000), "1000x1x1 should be linear");
+		assertTrue(PortabilityGeometryClassifier.isLinearInfrastructureBySize(1000, 2, 2, 4000), "1000x2x2 should be linear");
+		assertTrue(PortabilityGeometryClassifier.isLinearInfrastructureBySize(32, 1, 12, 384), "32x1x12 should be linear");
+		assertFalse(PortabilityGeometryClassifier.isLinearInfrastructureBySize(20, 20, 1, 400), "20x20x1 should be non-linear");
+		assertFalse(PortabilityGeometryClassifier.isLinearInfrastructureBySize(16, 16, 4, 1024), "16x16x4 should be non-linear");
 	}
 
 	private static void createOldSchemaMarker(Path db) throws Exception {
@@ -160,8 +283,15 @@ public final class BuildingIndexStoreStorageTest {
 		}
 	}
 
+	private static ComponentSummary findComponent(ExportBundle bundle, int minX) {
+		for (ComponentExport component : bundle.components) {
+			if (component.summary.minX == minX) return component.summary;
+		}
+		throw new AssertionError("No component with minX=" + minX);
+	}
+
 	private static void assertEquals(Object expected, Object actual, String message) {
-		if (!expected.equals(actual)) {
+		if (expected == null ? actual != null : !expected.equals(actual)) {
 			throw new AssertionError(message + ": expected=" + expected + " actual=" + actual);
 		}
 	}

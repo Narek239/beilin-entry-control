@@ -1,11 +1,18 @@
 {
   "required": true,
   "package": "us.beiyue.beilindataportability.platform.fabric121x.mixin",
+  "plugin": "us.beiyue.beilindataportability.platform.fabric121x.PortabilityOptionalMixinPlugin121x",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
+    "EffortlessBlockStateUpdateOperationMixin",
+    "EffortlessStructureBuilderMixin",
     "LevelSetBlockMixin",
     "ServerGamePacketListenerImplMixin",
-    "ServerPlayerGameModeMixin"
+    "ServerPlayerGameModeMixin",
+    "WorldEditClipboardCommandsMixin",
+    "WorldEditEditSessionMixin",
+    "WorldEditHistoryCommandsMixin",
+    "WorldEditRegionCommandsMixin"
   ],
   "injectors": {
     "defaultRequire": 1

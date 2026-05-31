@@ -26,10 +26,6 @@ public final class BuildingIndexStore {
 	private static final int REGION_MERGE_GAP_BLOCKS = 2;
 	private static final int MAX_AUTO_REGION_VOLUME = 2_000_000;
 	private static final int MIN_EXPORT_COMPONENT_BLOCKS = 8;
-	private static final int LINEAR_MIN_LONG_AXIS = 32;
-	private static final int LINEAR_MAX_CROSS_AXIS = 3;
-	private static final int LINEAR_WIDE_MAX_CROSS = 12;
-	private static final int LINEAR_WIDE_MIN_ASPECT = 16;
 	private static final int[][] NEIGHBORS = {
 		{1, 0, 0}, {-1, 0, 0},
 		{0, 1, 0}, {0, -1, 0},
@@ -128,18 +124,51 @@ public final class BuildingIndexStore {
 		String actorName,
 		String source
 	) {
+		recordStateChangeWithSource(
+			dimension,
+			x,
+			y,
+			z,
+			oldBlockState,
+			false,
+			newBlockState,
+			actorName,
+			source
+		);
+	}
+
+	public synchronized void recordStateChangeWithSource(
+		String dimension,
+		int x,
+		int y,
+		int z,
+		String oldBlockState,
+		boolean oldBlockReplaceable,
+		String newBlockState,
+		String actorName,
+		String source
+	) {
 		if (closed) return;
 		if (newBlockState == null || newBlockState.isBlank()) return;
 		String actor = displayActorName(actorName);
 		if (!isPlayerActor(actor)) return;
-		boolean newAir = isAirState(newBlockState);
-		boolean firstPlacement = !newAir && isAirState(oldBlockState);
-		if (!newAir && !firstPlacement) return;
+		PendingChange change = new PendingChange(
+			dimensionName(dimension),
+			x,
+			y,
+			z,
+			oldBlockState,
+			newBlockState,
+			actor,
+			oldBlockReplaceable,
+			false
+		);
+		if (!shouldApplyChange(change)) return;
 		boolean originalAutoCommit = true;
 		try {
 			originalAutoCommit = connection.getAutoCommit();
 			connection.setAutoCommit(false);
-			applyChange(new PendingChange(dimensionName(dimension), x, y, z, oldBlockState, newBlockState, actor));
+			applyChange(change);
 			connection.commit();
 		} catch (SQLException e) {
 			try {
@@ -147,6 +176,93 @@ public final class BuildingIndexStore {
 			} catch (SQLException ignored) {
 			}
 			log.warn("Failed to apply portability block change at {},{},{}: {}", x, y, z, e.toString());
+		} finally {
+			try {
+				connection.setAutoCommit(originalAutoCommit);
+			} catch (SQLException ignored) {
+			}
+		}
+	}
+
+	public synchronized void recordBulkStateChanges(List<BulkBlockChange> changes, String actorName, String source) {
+		if (closed || changes == null || changes.isEmpty()) return;
+		String actor = displayActorName(actorName);
+		if (!isPlayerActor(actor)) return;
+		List<PendingChange> pending = new ArrayList<>();
+		Set<String> seenCoordinates = new HashSet<>();
+		for (BulkBlockChange change : changes) {
+			if (change == null || change.newBlockState == null || change.newBlockState.isBlank()) continue;
+			String dimension = dimensionName(change.dimension);
+			String coordinateKey = dimension + '\0' + change.x + '\0' + change.y + '\0' + change.z;
+			if (!seenCoordinates.add(coordinateKey)) continue;
+			PendingChange pendingChange = new PendingChange(
+				dimension,
+				change.x,
+				change.y,
+				change.z,
+				change.oldBlockState,
+				change.newBlockState,
+				actor,
+				change.oldBlockReplaceable,
+				change.forcePlacement
+			);
+			if (shouldApplyChange(pendingChange)) pending.add(pendingChange);
+		}
+		if (pending.isEmpty()) return;
+		boolean originalAutoCommit = true;
+		try {
+			originalAutoCommit = connection.getAutoCommit();
+			connection.setAutoCommit(false);
+			for (PendingChange change : pending) {
+				applyChange(change);
+			}
+			connection.commit();
+		} catch (SQLException e) {
+			try {
+				connection.rollback();
+			} catch (SQLException ignored) {
+			}
+			log.warn("Failed to apply portability bulk block changes from {}: {}", source, e.toString());
+		} finally {
+			try {
+				connection.setAutoCommit(originalAutoCommit);
+			} catch (SQLException ignored) {
+			}
+		}
+	}
+
+	public synchronized void deleteIndexedBlocksInBounds(BulkPlacementBounds bounds, String actorName, String source) {
+		if (closed || bounds == null) return;
+		String actor = displayActorName(actorName);
+		if (!isPlayerActor(actor)) return;
+		boolean originalAutoCommit = true;
+		String dimension = dimensionName(bounds.dimension);
+		String now = SqliteUtcDatetimes.now();
+		try {
+			originalAutoCommit = connection.getAutoCommit();
+			connection.setAutoCommit(false);
+			Map<Long, Integer> affected = indexedBlockCountsInBounds(bounds, dimension);
+			if (affected.isEmpty()) {
+				connection.commit();
+				return;
+			}
+			deletePlacedBlocksInBounds(bounds, dimension);
+			for (Map.Entry<Long, Integer> entry : affected.entrySet()) {
+				long regionId = entry.getKey();
+				int deletedBlocks = Math.max(1, entry.getValue());
+				upsertAuthor(regionId, actor, 0, deletedBlocks, now);
+				touchRegion(regionId, now);
+				markDirty(regionId, now);
+				refreshAuthorRatios(regionId);
+				refreshRiskFlags(regionId);
+			}
+			connection.commit();
+		} catch (SQLException e) {
+			try {
+				connection.rollback();
+			} catch (SQLException ignored) {
+			}
+			log.warn("Failed to delete portability indexed block bounds from {}: {}", source, e.toString());
 		} finally {
 			try {
 				connection.setAutoCommit(originalAutoCommit);
@@ -214,9 +330,6 @@ public final class BuildingIndexStore {
 				if (nonAir < MIN_EXPORT_COMPONENT_BLOCKS) {
 					continue;
 				}
-				if (isLinearInfrastructure(bounds, nonAir)) {
-					continue;
-				}
 				String risks = riskFlags(bounds, nonAir, region.authorCount, region.targetRatioBp);
 				String filename = String.format(
 					Locale.ROOT,
@@ -262,7 +375,7 @@ public final class BuildingIndexStore {
 		String actorName = displayActorName(change.actorName);
 		boolean playerActor = isPlayerActor(actorName);
 		boolean newAir = isAirState(change.newBlockState);
-		boolean firstPlacement = !newAir && isAirState(change.oldBlockState);
+		boolean firstPlacement = isFirstPlacement(change, newAir);
 		boolean playerCanExpandRegion = playerActor && firstPlacement;
 		Region region = findCandidateRegion(change.dimension, change.x, change.y, change.z, playerCanExpandRegion);
 		String now = SqliteUtcDatetimes.now();
@@ -297,6 +410,16 @@ public final class BuildingIndexStore {
 			refreshRiskFlags(region.id);
 			mergeCompatibleRegions(region.id);
 		}
+	}
+
+	private static boolean shouldApplyChange(PendingChange change) {
+		boolean newAir = isAirState(change.newBlockState);
+		return newAir || isFirstPlacement(change, false);
+	}
+
+	private static boolean isFirstPlacement(PendingChange change, boolean newAir) {
+		return !newAir
+			&& (isAirState(change.oldBlockState) || change.oldBlockReplaceable || change.forcePlacement);
 	}
 
 	private void initializeSchema() throws SQLException {
@@ -366,6 +489,7 @@ public final class BuildingIndexStore {
 				)
 				""");
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_region_blocks_region ON region_blocks(region_id)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_region_blocks_dimension_xyz_region ON region_blocks(dimension, x, y, z, region_id)");
 		}
 	}
 
@@ -532,6 +656,50 @@ public final class BuildingIndexStore {
 			ps.setInt(5, z);
 			ps.executeUpdate();
 		}
+	}
+
+	private Map<Long, Integer> indexedBlockCountsInBounds(BulkPlacementBounds bounds, String dimension) throws SQLException {
+		Map<Long, Integer> affected = new HashMap<>();
+		try (PreparedStatement ps = connection.prepareStatement("""
+			SELECT region_id, COUNT(*) AS deleted_count
+			FROM region_blocks
+			WHERE dimension = ?
+			  AND x BETWEEN ? AND ?
+			  AND y BETWEEN ? AND ?
+			  AND z BETWEEN ? AND ?
+			GROUP BY region_id
+			""")) {
+			bindBounds(ps, dimension, bounds);
+			try (ResultSet rs = ps.executeQuery()) {
+				while (rs.next()) {
+					affected.put(rs.getLong("region_id"), rs.getInt("deleted_count"));
+				}
+			}
+		}
+		return affected;
+	}
+
+	private void deletePlacedBlocksInBounds(BulkPlacementBounds bounds, String dimension) throws SQLException {
+		try (PreparedStatement ps = connection.prepareStatement("""
+			DELETE FROM region_blocks
+			WHERE dimension = ?
+			  AND x BETWEEN ? AND ?
+			  AND y BETWEEN ? AND ?
+			  AND z BETWEEN ? AND ?
+			""")) {
+			bindBounds(ps, dimension, bounds);
+			ps.executeUpdate();
+		}
+	}
+
+	private static void bindBounds(PreparedStatement ps, String dimension, BulkPlacementBounds bounds) throws SQLException {
+		ps.setString(1, dimension);
+		ps.setInt(2, bounds.minX);
+		ps.setInt(3, bounds.maxX);
+		ps.setInt(4, bounds.minY);
+		ps.setInt(5, bounds.maxY);
+		ps.setInt(6, bounds.minZ);
+		ps.setInt(7, bounds.maxZ);
 	}
 
 	private Region findCandidateRegion(String dimension, int x, int y, int z, boolean expanding) throws SQLException {
@@ -939,27 +1107,19 @@ public final class BuildingIndexStore {
 		if (targetRatio > 0 && targetRatio < 5000) risks.add("low_target_authorship");
 		if (volume > 500_000) risks.add("large_cuboid");
 		if (volume > 0 && nonAir > 0 && nonAir * 10000L / volume < 250) risks.add("low_density");
-		if (isLinearInfrastructure(bounds, nonAir)) risks.add("linear_infrastructure_excluded");
 		return risks.isEmpty() ? null : String.join(",", risks);
 	}
 
 	private static boolean isLinearInfrastructure(Bounds bounds, int nonAir) {
-		int x = bounds.sizeX();
-		int y = bounds.sizeY();
-		int z = bounds.sizeZ();
-		int longest = Math.max(x, Math.max(y, z));
-		int shortest = Math.min(x, Math.min(y, z));
-		int middle = x + y + z - longest - shortest;
-		int crossMax = Math.max(middle, shortest);
-		boolean horizontal = x == longest || z == longest;
-		if (longest < LINEAR_MIN_LONG_AXIS) return false;
-		boolean narrow = crossMax <= LINEAR_MAX_CROSS_AXIS;
-		boolean wideLinear = crossMax <= LINEAR_WIDE_MAX_CROSS
-			&& longest >= LINEAR_WIDE_MIN_ASPECT * crossMax;
-		if (!narrow && !wideLinear) return false;
-		if (horizontal) return true;
-		int volume = safeVolume(bounds);
-		return volume <= 0 || nonAir <= 0 || nonAir * 10000L / volume < 4500;
+		return PortabilityGeometryClassifier.isLinearInfrastructure(
+			bounds.minX,
+			bounds.minY,
+			bounds.minZ,
+			bounds.maxX,
+			bounds.maxY,
+			bounds.maxZ,
+			nonAir
+		);
 	}
 
 	private static int safeVolume(Bounds bounds) {
@@ -1007,8 +1167,20 @@ public final class BuildingIndexStore {
 		final String oldBlockState;
 		final String newBlockState;
 		final String actorName;
+		final boolean oldBlockReplaceable;
+		final boolean forcePlacement;
 
-		PendingChange(String dimension, int x, int y, int z, String oldBlockState, String newBlockState, String actorName) {
+		PendingChange(
+			String dimension,
+			int x,
+			int y,
+			int z,
+			String oldBlockState,
+			String newBlockState,
+			String actorName,
+			boolean oldBlockReplaceable,
+			boolean forcePlacement
+		) {
 			this.dimension = dimension;
 			this.x = x;
 			this.y = y;
@@ -1016,6 +1188,8 @@ public final class BuildingIndexStore {
 			this.oldBlockState = oldBlockState;
 			this.newBlockState = newBlockState;
 			this.actorName = actorName;
+			this.oldBlockReplaceable = oldBlockReplaceable;
+			this.forcePlacement = forcePlacement;
 		}
 	}
 

@@ -8,6 +8,10 @@ repositories {
 		name = "Fabric"
 		url = "https://maven.fabricmc.net/"
 	}
+	maven {
+		name = "EngineHub"
+		url = "https://maven.enginehub.org/repo/"
+	}
 }
 
 allprojects {
@@ -23,6 +27,10 @@ subprojects {
 		maven {
 			name = "Fabric"
 			url = "https://maven.fabricmc.net/"
+		}
+		maven {
+			name = "EngineHub"
+			url = "https://maven.enginehub.org/repo/"
 		}
 	}
 }

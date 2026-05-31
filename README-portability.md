@@ -14,11 +14,11 @@ Beilin Data Portability 是 Beilin Entry Control 的 Fabric 服务端附属模�
 - **自动构建导出包**\
   管理员审核通过后，模组会自动生成 `.litematic` 文件，并上传至 beiyue.us 交付链路。
 
-- **低负担世界索引**\
-  模组仅记录数据导出所需的最小必要信息，随世界目录一并备份和回档。
+- **低性能负担**\
+  模组仅索引数据导出所需的最小必要信息，随世界目录一并备份和回档。
 
-- **管理员行为可见**\
-  管理员可登录 beiyue.us 了解导出请求、manifest、风险标记、交付物大小和失败原因。
+- **行为可观测性**\
+  管理员可登录 beiyue.us 了解导出请求、组件明细、风险标记、交付物大小和失败原因。
 
 ---
 
@@ -71,6 +71,9 @@ Beilin Data Portability 是 Beilin Entry Control 的 Fabric 服务端附属模�
 {
   "exportProcessingEnabled": true,
   "recordingEnabled": true,
+  "recordWorldEditBulkPlacements": true,
+  "recordEffortlessBulkPlacements": true,
+  "discardLinearBulkPlacements": true,
   "artifactDirectory": "beilin-data-portability-exports",
   "maxExportVolumeBlocks": 4000000,
   "scanChunksPerTick": 12
@@ -83,6 +86,18 @@ Beilin Data Portability 是 Beilin Entry Control 的 Fabric 服务端附属模�
 
 - **`recordingEnabled`**
   - 是否为玩家建筑建立索引；
+  - 默认值为 `true`。
+
+- **`recordWorldEditBulkPlacements`**
+  - 是否记录玩家通过 WorldEdit 产生的结构变更；
+  - 默认值为 `true`。
+
+- **`recordEffortlessBulkPlacements`**
+  - 是否记录玩家通过 Effortless Structure 产生的结构变更；
+  - 默认值为 `true`。
+
+- **`discardLinearBulkPlacements`**
+  - 是否忽略长条状线性结构（如铁路线路）的新增索引；
   - 默认值为 `true`。
 
 - **`artifactDirectory`**
@@ -125,6 +140,8 @@ Beilin Data Portability 是 Beilin Entry Control 的 Fabric 服务端附属模�
 - 建筑区域的维度与包围盒；
 - 用户名归属与作者比例；
 - 最近触达时间、风险标记和扫描缓存信息。
+
+通过 WorldEdit 或 Effortless Structure 产生结构变更时，模组会以执行玩家作为归属记录。
 
 ---
 

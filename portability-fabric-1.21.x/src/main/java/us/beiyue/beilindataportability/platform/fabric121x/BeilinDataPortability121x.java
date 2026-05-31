@@ -44,6 +44,11 @@ public final class BeilinDataPortability121x implements ModInitializer {
 			() -> addonConfig != null && addonConfig.recordingEnabled ? indexStore : null,
 			LOGGER
 		);
+		BlockChangeRecorder121x.configureBulkOptions(
+			addonConfig.recordWorldEditBulkPlacements,
+			addonConfig.recordEffortlessBulkPlacements,
+			addonConfig.discardLinearBulkPlacements
+		);
 		if (!addonConfig.exportProcessingEnabled) {
 			LOGGER.info("Beilin Data Portability is installed. Recording={}, export processing disabled. Edit {} to enable WebSocket export processing.", addonConfig.recordingEnabled, PortabilityAddonConfig121x.configPath());
 		}
