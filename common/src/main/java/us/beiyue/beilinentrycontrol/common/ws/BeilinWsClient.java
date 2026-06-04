@@ -161,6 +161,7 @@ public final class BeilinWsClient {
 		backupInetCacheExpiryMs = 0L;
 		backupInetCursor = 0;
 		reconnectScheduled.set(false);
+		BeilinWsEvents.setStructureAuditSender(this::sendStructureAuditEventsJson);
 		connectAsync();
 	}
 
@@ -185,6 +186,7 @@ public final class BeilinWsClient {
 		apiClient.shutdownNow();
 		shutdownOkHttp(primaryWsClient);
 		shutdownOkHttp(backupWsClient);
+		BeilinWsEvents.setStructureAuditSender(null);
 	}
 
 	boolean runOnScheduler(Runnable r) {
@@ -504,6 +506,21 @@ public final class BeilinWsClient {
 		}
 	}
 
+	private boolean sendStructureAuditEventsJson(String text) {
+		try {
+			WebSocket ws = wsRef.get();
+			if (ws == null || text == null || text.isBlank()) return false;
+			boolean ok = ws.send(text);
+			if (!ok) {
+				log.warn("Beilin WS structure audit send failed: output queue closed");
+			}
+			return ok;
+		} catch (Exception e) {
+			log.warn("Beilin WS structure audit send failed: {}", e.toString());
+			return false;
+		}
+	}
+
 	private void syncOnlinePlayersAfterWsConnect() {
 		if (isStopped()) return;
 		hooks.runOnServerThread(() -> {
@@ -634,6 +651,13 @@ public final class BeilinWsClient {
 				lastPongTime = System.currentTimeMillis();
 				return;
 			}
+			if ("structure_audit_ack".equals(action)) {
+				List<String> eventIds = parseStringArray(o, "event_ids");
+				if (!eventIds.isEmpty()) {
+					BeilinWsEvents.dispatchStructureAuditAck(eventIds);
+				}
+				return;
+			}
 			if ("kick".equals(action)) {
 				String username = null;
 				if (o.has("username")) username = o.get("username").getAsString();
@@ -679,6 +703,19 @@ public final class BeilinWsClient {
 				stringOrNull(o, "requested_at"),
 				stringOrNull(o, "reviewed_at")
 			));
+		}
+		return out;
+	}
+
+	private static List<String> parseStringArray(JsonObject root, String key) {
+		JsonArray values = root.has(key) && root.get(key).isJsonArray()
+			? root.getAsJsonArray(key)
+			: new JsonArray();
+		List<String> out = new ArrayList<>();
+		for (JsonElement e : values) {
+			if (!e.isJsonPrimitive()) continue;
+			String value = e.getAsString();
+			if (value != null && !value.isBlank()) out.add(value);
 		}
 		return out;
 	}

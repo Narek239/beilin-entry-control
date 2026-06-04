@@ -68,12 +68,13 @@ public final class BuildingIndexStoreStorageTest {
 			try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
 				 Statement s = c.createStatement()) {
 				assertEquals("wal", scalarString(s, "PRAGMA journal_mode"), "SQLite journal mode should be WAL");
-				assertEquals(7, scalarInt(s, "PRAGMA user_version"), "schema version should be v7");
+				assertEquals(8, scalarInt(s, "PRAGMA user_version"), "schema version should be v8");
 				assertTrue(tableExists(s, "current_blocks"), "old per-block table should be retained during non-destructive migration");
 				assertFalse(tableExists(s, "block_events"), "change log table should not exist");
 				assertTrue(tableExists(s, "building_regions"), "v5 region table should exist");
 				assertTrue(tableExists(s, "region_authors"), "v5 author table should exist");
 				assertTrue(tableExists(s, "region_blocks"), "v6 placed block table should exist");
+				assertTrue(tableExists(s, "structure_audit_outbox"), "v8 structure audit outbox table should exist");
 				assertFalse(tableExists(s, "region_chunk_index"), "unused chunk index table should not be created for new schemas");
 				assertEquals(2, scalarInt(s, "SELECT COUNT(DISTINCT player_name_key) FROM region_authors WHERE player_name_key IN ('alice','bob')"), "authors should be keyed by normalized username");
 				assertEquals(0, scalarInt(s, """
@@ -87,8 +88,10 @@ public final class BuildingIndexStoreStorageTest {
 					"""), "placed block datetimes should be normalized");
 				}
 				assertRecordingSemantics(dir);
+				assertStructureAuditSwitch(dir);
 				assertBoundsDeletion(dir);
 				assertNonLinearBoundsDeletion(dir);
+				assertDimensionNormalization();
 				assertGeometryClassifier();
 		} finally {
 			if (store != null) {
@@ -108,7 +111,7 @@ public final class BuildingIndexStoreStorageTest {
 				store.recordBulkStateChanges(actor.bulkChanges(), actor.name, actor.source)
 			)) {
 				ActorContext.current().addBulkChange(new BulkBlockChange(
-					"minecraft:overworld",
+					"world__minecraft:overworld",
 					2,
 					64,
 					0,
@@ -123,7 +126,7 @@ public final class BuildingIndexStoreStorageTest {
 			try (ActorContext.Scope scope = ActorContext.pushBulkDeleteBounds(
 				"Alice",
 				"WORLDEDIT_SET",
-				new BulkPlacementBounds("minecraft:overworld", 3, 64, 0, 3, 64, 0, 1),
+				new BulkPlacementBounds("world__minecraft:overworld", 3, 64, 0, 3, 64, 0, 1),
 				actor -> store.deleteIndexedBlocksInBounds(actor.bulkBounds(), actor.name, actor.source)
 			)) {
 				ActorContext.current().addBulkChange(new BulkBlockChange(
@@ -149,7 +152,79 @@ public final class BuildingIndexStoreStorageTest {
 			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 3"), "bulk DELETE_BOUNDS should remove indexed coordinates in range");
 			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 4"), "bulk DELETE_BOUNDS should keep coordinates outside range");
 			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 5"), "bulk DELETE_BOUNDS should not collect coordinates");
+			assertEquals(2, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox"), "bulk record/delete should enqueue two structure audit summaries");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE tool = 'WORLDEDIT' AND operation = 'SET' AND change_type = 'place' AND changed_block_count = 1"), "bulk placement audit should summarize accepted coordinates");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE tool = 'WORLDEDIT' AND operation = 'SET' AND change_type = 'delete' AND changed_block_count = 1"), "bulk delete audit should prefer actual indexed deletion count");
+			assertEquals(2, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE dimension = 'minecraft:overworld'"), "bulk audit dimensions should be canonicalized");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE dimension LIKE 'world%minecraft:%'"), "WorldEdit Fabric world id should not leak into audit dimensions");
 		}
+		BuildingIndexStore ackStore = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			List<StructureAuditEvent> pending = ackStore.listPendingStructureAuditEvents(10);
+			assertEquals(2, pending.size(), "outbox listing should expose pending audit summaries for WebSocket flush");
+			String message = StructureAuditEvent.toWsMessage(pending);
+			assertTrue(message.contains("\"action\":\"structure_audit_events\""), "outbox payload should use structure audit WebSocket action");
+			assertTrue(message.contains("\"changed_block_count\":1"), "outbox payload should include summary counts");
+			List<String> ackIds = new ArrayList<>();
+			ackIds.add(pending.get(0).eventId);
+			ackStore.deleteStructureAuditOutboxEvents(ackIds);
+			assertEquals(1, ackStore.listPendingStructureAuditEvents(10).size(), "ack deletion should remove acknowledged audit summaries");
+		} finally {
+			ackStore.close();
+		}
+	}
+
+	private static void assertStructureAuditSwitch(Path dir) throws Exception {
+		Path db = dir.resolve("audit-disabled.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			store.setStructureAuditEnabled(false);
+			List<BulkBlockChange> changes = new ArrayList<>();
+			changes.add(new BulkBlockChange(
+				"world__minecraft:overworld",
+				0,
+				64,
+				0,
+				"minecraft:stone",
+				"minecraft:oak_planks",
+				false,
+				true
+			));
+			store.recordBulkStateChanges(changes, "Alice", "WORLDEDIT_SET");
+			store.recordPlaced("minecraft:overworld", 1, 64, 0, "minecraft:stone", "Alice");
+			store.recordPlaced("minecraft:overworld", 2, 64, 0, "minecraft:stone", "Alice");
+			store.deleteIndexedBlocksInBounds(
+				new BulkPlacementBounds("minecraft:overworld", 1, 64, 0, 1, 64, 0, 1),
+				"Alice",
+				"WORLDEDIT_CUT"
+			);
+			assertTrue(store.diagnosticSummary().contains("structure_audit=disabled"), "diagnostics should show disabled structure audit");
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 0"), "disabled audit should still record bulk placements");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 1"), "disabled audit should still apply bounds deletion");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 2"), "disabled audit should preserve coordinates outside bounds deletion");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox"), "disabled audit should not enqueue structure audit events");
+		}
+	}
+
+	private static void assertDimensionNormalization() {
+		assertEquals("minecraft:overworld", DimensionNames.normalize("world__minecraft:overworld"), "WorldEdit Fabric overworld id should normalize");
+		assertEquals("minecraft:the_nether", DimensionNames.normalize("world_minecraft:the_nether"), "WorldEdit Fabric vanilla dimension id should normalize");
+		assertEquals("custom_mod:moon", DimensionNames.normalizeWorldEditId("world_custom_mod:moon", "world"), "WorldEdit id should strip the known world name without damaging custom namespaces");
+		assertEquals("custom_mod:moon", BulkPlacementIntrospection.worldEditWorldDimension(new FakeWorldEditWorld("world", "world_custom_mod:moon")), "WorldEdit world dimension helper should normalize ids");
+		StructureAuditEvent event = StructureAuditEvent.fromBounds(
+			new BulkPlacementBounds("world__minecraft:overworld", 1, 2, 3, 1, 2, 3, 1),
+			"Alice",
+			"WORLDEDIT_SET",
+			"place",
+			1,
+			SqliteUtcDatetimes.now()
+		);
+		assertEquals("minecraft:overworld", event.dimension, "audit events should store canonical dimensions");
 	}
 
 	private static void assertBoundsDeletion(Path dir) throws Exception {
@@ -316,6 +391,28 @@ public final class BuildingIndexStoreStorageTest {
 			for (Path p : paths.sorted(Comparator.reverseOrder()).toList()) {
 				Files.deleteIfExists(p);
 			}
+		}
+	}
+
+	private static final class FakeWorldEditWorld {
+		private final String name;
+		private final String id;
+
+		FakeWorldEditWorld(String name, String id) {
+			this.name = name;
+			this.id = id;
+		}
+
+		public Object getWorld() {
+			return null;
+		}
+
+		public String getName() {
+			return name;
+		}
+
+		public String getId() {
+			return id;
 		}
 	}
 

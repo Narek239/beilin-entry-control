@@ -73,6 +73,7 @@ Beilin Data Portability 是 Beilin Entry Control 的 Fabric 服务端附属模�
   "recordingEnabled": true,
   "recordWorldEditBulkPlacements": true,
   "recordEffortlessBulkPlacements": true,
+  "structureAuditEnabled": true,
   "discardLinearBulkPlacements": true,
   "artifactDirectory": "beilin-data-portability-exports",
   "maxExportVolumeBlocks": 4000000,
@@ -94,6 +95,11 @@ Beilin Data Portability 是 Beilin Entry Control 的 Fabric 服务端附属模�
 
 - **`recordEffortlessBulkPlacements`**
   - 是否记录玩家通过 Effortless Structure 产生的结构变更；
+  - 默认值为 `true`。
+
+- **`structureAuditEnabled`**
+  - 是否上报由 WorldEdit、Effortless Structure 产生结构变更；
+  - beiyue.us 上的“结更审计”功能依赖此项运行；
   - 默认值为 `true`。
 
 - **`discardLinearBulkPlacements`**
@@ -167,7 +173,7 @@ Beilin Data Portability 是 Beilin Entry Control 的 Fabric 服务端附属模�
 
 - 本模组仅为建筑数据可携带导出记录必要索引，详见 `索引与存储说明`。
 - 不会修改其他模组或 Minecraft 的配置文件，也不会改动原版世界存档结构。
-- 所有与 beiyue.us 的通信仅围绕导出任务领取、导出包上传和状态回报进行。
+- 所有与 beiyue.us 的通信仅围绕导出任务领取、导出包上传、状态回报和结构变更事件进行。
 - 本模组复用 Beilin Entry Control 的 API 凭据和导出任务推送，不替代入服控制逻辑。
 
 如有任何其他疑问，请联系 Narek。

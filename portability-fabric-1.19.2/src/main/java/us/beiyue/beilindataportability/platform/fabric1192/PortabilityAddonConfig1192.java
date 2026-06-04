@@ -19,6 +19,7 @@ public final class PortabilityAddonConfig1192 {
 	public boolean recordingEnabled = true;
 	public boolean recordWorldEditBulkPlacements = true;
 	public boolean recordEffortlessBulkPlacements = true;
+	public boolean structureAuditEnabled = true;
 	public boolean discardLinearBulkPlacements = true;
 	public String artifactDirectory = "beilin-data-portability-exports";
 	public int maxExportVolumeBlocks = 4_000_000;

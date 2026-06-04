@@ -132,12 +132,16 @@ public final class BulkPlacementIntrospection {
 
 	public static String worldEditDimension(Object editSession) {
 		Object worldEditWorld = invoke(editSession, "getWorld");
+		return worldEditWorldDimension(worldEditWorld);
+	}
+
+	public static String worldEditWorldDimension(Object worldEditWorld) {
 		Object minecraftWorld = invoke(worldEditWorld, "getWorld");
 		String dimension = dimensionString(minecraftWorld);
 		if (dimension != null) return dimension;
-		String id = stringValue(invoke(worldEditWorld, "getId"));
-		if (id != null && id.contains(":")) return id;
 		String name = stringValue(invoke(worldEditWorld, "getName"));
+		String id = stringValue(invoke(worldEditWorld, "getId"));
+		if (id != null && id.contains(":")) return DimensionNames.normalizeWorldEditId(id, name);
 		if (name != null && name.contains(":")) return name;
 		return "minecraft:overworld";
 	}

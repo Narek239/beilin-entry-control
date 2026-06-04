@@ -138,18 +138,37 @@ public final class BlockChangeRecorder1192 {
 	}
 
 	public static void recordWorldEditSetBlock(Object editSession, Object position, Object newState) {
+		recordWorldEditBulkBlock(worldEditLevel(editSession), position, newState, true);
+	}
+
+	public static void recordWorldEditExtentBlock(Object worldEditWorld, Object position, Object newState) {
+		Level level = worldEditWorldLevel(worldEditWorld);
+		String dimension = level != null
+			? level.dimension().location().toString()
+			: BulkPlacementIntrospection.worldEditWorldDimension(worldEditWorld);
+		recordWorldEditBulkBlock(dimension, position, newState, false);
+	}
+
+	private static void recordWorldEditBulkBlock(Level level, Object position, Object newState, boolean strict) {
+		String dimension = level != null ? level.dimension().location().toString() : null;
+		recordWorldEditBulkBlock(dimension, position, newState, strict);
+	}
+
+	private static void recordWorldEditBulkBlock(String dimension, Object position, Object newState, boolean strict) {
 		ActorContext.Actor actor = ActorContext.current();
 		if (actor == null || actor.shouldIgnoreBlockRecords()) return;
 		if (!actor.shouldForcePlacementRecords()) return;
-		Level level = worldEditLevel(editSession);
 		Integer x = BulkPlacementIntrospection.blockCoordinate(position, "x");
 		Integer y = BulkPlacementIntrospection.blockCoordinate(position, "y");
 		Integer z = BulkPlacementIntrospection.blockCoordinate(position, "z");
-		if (level == null || x == null || y == null || z == null || newState == null) {
-			throw new IllegalStateException("Unable to record WorldEdit set block: missing level, position, or block state");
+		if (dimension == null || x == null || y == null || z == null || newState == null) {
+			if (strict) {
+				throw new IllegalStateException("Unable to record WorldEdit set block: missing level, position, or block state");
+			}
+			return;
 		}
 		actor.addBulkChange(new BulkBlockChange(
-			level.dimension().location().toString(),
+			dimension,
 			x,
 			y,
 			z,
@@ -229,17 +248,21 @@ public final class BlockChangeRecorder1192 {
 
 	private static ActorContext.Scope beginBulkRecordOrDiscardLinear(String actorName, String source, BulkPlacementBounds bounds) {
 		if (bounds != null && discardLinearBulkPlacements && bounds.isLinearInfrastructure()) {
-			return beginBulkDeleteBounds(actorName, source, bounds);
+			return beginBulkDeleteBounds(actorName, source, bounds, "mixed");
 		}
 		return ActorContext.pushBulkRecord(actorName, source, BlockChangeRecorder1192::flushBulkChanges);
 	}
 
 	private static ActorContext.Scope beginBulkDeleteBounds(String actorName, String source, BulkPlacementBounds bounds) {
+		return beginBulkDeleteBounds(actorName, source, bounds, "delete");
+	}
+
+	private static ActorContext.Scope beginBulkDeleteBounds(String actorName, String source, BulkPlacementBounds bounds, String changeType) {
 		if (bounds == null) return ActorContext.pushBulkRecord(actorName, source, BlockChangeRecorder1192::flushBulkChanges);
-		return ActorContext.pushBulkDeleteBounds(actorName, source, bounds, actor -> {
+		return ActorContext.pushBulkDeleteBounds(actorName, source, bounds, changeType, actor -> {
 			BuildingIndexStore store = storeSupplier.get();
 			if (store != null) {
-				store.deleteIndexedBlocksInBounds(actor.bulkBounds(), actor.name, actor.source);
+				store.deleteIndexedBlocksInBounds(actor.bulkBounds(), actor.name, actor.source, actor.bulkChangeType());
 			}
 		});
 	}
@@ -253,6 +276,10 @@ public final class BlockChangeRecorder1192 {
 
 	private static Level worldEditLevel(Object editSession) {
 		Object worldEditWorld = BulkPlacementIntrospection.invokeNoArgs(editSession, "getWorld");
+		return worldEditWorldLevel(worldEditWorld);
+	}
+
+	private static Level worldEditWorldLevel(Object worldEditWorld) {
 		Object minecraftWorld = BulkPlacementIntrospection.invokeNoArgs(worldEditWorld, "getWorld");
 		return minecraftWorld instanceof Level level ? level : null;
 	}

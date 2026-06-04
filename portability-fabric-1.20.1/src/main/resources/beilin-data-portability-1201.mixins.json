@@ -12,7 +12,8 @@
     "WorldEditClipboardCommandsMixin",
     "WorldEditEditSessionMixin",
     "WorldEditHistoryCommandsMixin",
-    "WorldEditRegionCommandsMixin"
+    "WorldEditRegionCommandsMixin",
+    "WorldEditSideEffectExtentMixin"
   ],
   "injectors": {
     "defaultRequire": 1

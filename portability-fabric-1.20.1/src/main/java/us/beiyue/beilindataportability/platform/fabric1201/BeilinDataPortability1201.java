@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 import us.beiyue.beilindataportability.common.BuildingIndexStore;
 import us.beiyue.beilindataportability.common.PortabilityApiClient;
 import us.beiyue.beilindataportability.common.PortabilityRuntime;
+import us.beiyue.beilindataportability.common.StructureAuditOutboxDispatcher;
 
 import java.nio.file.Path;
 
@@ -24,6 +25,7 @@ public final class BeilinDataPortability1201 implements ModInitializer {
 	private static volatile BuildingIndexStore activeStore;
 
 	private PortabilityRuntime runtime;
+	private StructureAuditOutboxDispatcher auditDispatcher;
 	private BuildingIndexStore indexStore;
 	private PortabilityAddonConfig1201 addonConfig;
 	private SharedControlConfig1201 controlConfig;
@@ -52,6 +54,9 @@ public final class BeilinDataPortability1201 implements ModInitializer {
 		if (!addonConfig.exportProcessingEnabled) {
 			LOGGER.info("Beilin Data Portability is installed. Recording={}, export processing disabled. Edit {} to enable WebSocket export processing.", addonConfig.recordingEnabled, PortabilityAddonConfig1201.configPath());
 		}
+		if (!addonConfig.structureAuditEnabled) {
+			LOGGER.info("Beilin Data Portability structure audit is disabled. Edit {} to enable structure audit event recording.", PortabilityAddonConfig1201.configPath());
+		}
 		if (addonConfig.exportProcessingEnabled && !controlConfig.isApiKeyConfigured()) {
 			LOGGER.warn("Beilin Data Portability cannot start because {} has no valid apiKey.", SharedControlConfig1201.configPath());
 		}
@@ -67,7 +72,12 @@ public final class BeilinDataPortability1201 implements ModInitializer {
 			Path dbPath = resolveWorldDbPath(server);
 			Path artifactDir = resolveArtifactDir(addonConfig.artifactDirectory);
 			indexStore = BuildingIndexStore.open(dbPath, new Slf4jCommonLogger(LOGGER));
+			indexStore.setStructureAuditEnabled(addonConfig.structureAuditEnabled);
 			activeStore = indexStore;
+			if (addonConfig.structureAuditEnabled) {
+				auditDispatcher = new StructureAuditOutboxDispatcher(indexStore, new Slf4jCommonLogger(LOGGER));
+				auditDispatcher.start();
+			}
 			if (addonConfig.exportProcessingEnabled && controlConfig.isApiKeyConfigured()) {
 				PortabilityApiClient apiClient = new PortabilityApiClient(controlConfig);
 				runtime = new PortabilityRuntime(
@@ -89,6 +99,10 @@ public final class BeilinDataPortability1201 implements ModInitializer {
 		if (runtime != null) {
 			runtime.stop();
 			runtime = null;
+		}
+		if (auditDispatcher != null) {
+			auditDispatcher.stop();
+			auditDispatcher = null;
 		}
 		if (indexStore != null) {
 			indexStore.close();

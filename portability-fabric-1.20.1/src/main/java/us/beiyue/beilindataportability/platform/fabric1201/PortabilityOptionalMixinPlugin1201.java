@@ -23,7 +23,8 @@ public final class PortabilityOptionalMixinPlugin1201 implements IMixinConfigPlu
 		if (mixinClassName.endsWith(".WorldEditRegionCommandsMixin")
 			|| mixinClassName.endsWith(".WorldEditEditSessionMixin")
 			|| mixinClassName.endsWith(".WorldEditClipboardCommandsMixin")
-			|| mixinClassName.endsWith(".WorldEditHistoryCommandsMixin")) {
+			|| mixinClassName.endsWith(".WorldEditHistoryCommandsMixin")
+			|| mixinClassName.endsWith(".WorldEditSideEffectExtentMixin")) {
 			return FabricLoader.getInstance().isModLoaded("worldedit");
 		}
 		if (mixinClassName.endsWith(".EffortlessStructureBuilderMixin")

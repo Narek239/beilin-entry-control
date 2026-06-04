@@ -22,7 +22,7 @@ import java.util.Map;
 import java.util.Set;
 
 public final class BuildingIndexStore {
-	private static final int SCHEMA_VERSION = 7;
+	private static final int SCHEMA_VERSION = 8;
 	private static final int REGION_MERGE_GAP_BLOCKS = 2;
 	private static final int MAX_AUTO_REGION_VOLUME = 2_000_000;
 	private static final int MIN_EXPORT_COMPONENT_BLOCKS = 8;
@@ -36,6 +36,7 @@ public final class BuildingIndexStore {
 	private final CommonLogger log;
 	private final Connection connection;
 	private volatile boolean closed = false;
+	private volatile boolean structureAuditEnabled = true;
 
 	private BuildingIndexStore(Path dbPath, CommonLogger log, Connection connection) {
 		this.dbPath = dbPath;
@@ -90,7 +91,13 @@ public final class BuildingIndexStore {
 	public synchronized String diagnosticSummary() {
 		return "db=" + dbPath
 			+ ", indexed_regions=" + countRegions()
+			+ ", structure_audit=" + (structureAuditEnabled ? "enabled" : "disabled")
+			+ ", pending_structure_audit=" + countPendingStructureAuditEvents()
 			+ ", schema=v" + SCHEMA_VERSION;
+	}
+
+	public synchronized void setStructureAuditEnabled(boolean enabled) {
+		structureAuditEnabled = enabled;
 	}
 
 	public synchronized void recordPlaced(
@@ -189,6 +196,8 @@ public final class BuildingIndexStore {
 		String actor = displayActorName(actorName);
 		if (!isPlayerActor(actor)) return;
 		List<PendingChange> pending = new ArrayList<>();
+		boolean auditEnabled = structureAuditEnabled;
+		List<BulkBlockChange> auditChanges = auditEnabled ? new ArrayList<>() : null;
 		Set<String> seenCoordinates = new HashSet<>();
 		for (BulkBlockChange change : changes) {
 			if (change == null || change.newBlockState == null || change.newBlockState.isBlank()) continue;
@@ -206,15 +215,27 @@ public final class BuildingIndexStore {
 				change.oldBlockReplaceable,
 				change.forcePlacement
 			);
-			if (shouldApplyChange(pendingChange)) pending.add(pendingChange);
+			if (shouldApplyChange(pendingChange)) {
+				pending.add(pendingChange);
+				if (auditChanges != null) {
+					auditChanges.add(change);
+				}
+			}
 		}
 		if (pending.isEmpty()) return;
 		boolean originalAutoCommit = true;
+		String now = SqliteUtcDatetimes.now();
+		List<StructureAuditEvent> auditEvents = auditEnabled
+			? StructureAuditEvent.fromBulkChanges(auditChanges, actor, source, now)
+			: List.of();
 		try {
 			originalAutoCommit = connection.getAutoCommit();
 			connection.setAutoCommit(false);
 			for (PendingChange change : pending) {
 				applyChange(change);
+			}
+			for (StructureAuditEvent event : auditEvents) {
+				insertStructureAuditEvent(event);
 			}
 			connection.commit();
 		} catch (SQLException e) {
@@ -232,6 +253,10 @@ public final class BuildingIndexStore {
 	}
 
 	public synchronized void deleteIndexedBlocksInBounds(BulkPlacementBounds bounds, String actorName, String source) {
+		deleteIndexedBlocksInBounds(bounds, actorName, source, "delete");
+	}
+
+	public synchronized void deleteIndexedBlocksInBounds(BulkPlacementBounds bounds, String actorName, String source, String changeType) {
 		if (closed || bounds == null) return;
 		String actor = displayActorName(actorName);
 		if (!isPlayerActor(actor)) return;
@@ -242,19 +267,27 @@ public final class BuildingIndexStore {
 			originalAutoCommit = connection.getAutoCommit();
 			connection.setAutoCommit(false);
 			Map<Long, Integer> affected = indexedBlockCountsInBounds(bounds, dimension);
-			if (affected.isEmpty()) {
-				connection.commit();
-				return;
+			int changedBlocks = 0;
+			for (Integer value : affected.values()) {
+				changedBlocks += Math.max(0, value == null ? 0 : value);
 			}
-			deletePlacedBlocksInBounds(bounds, dimension);
-			for (Map.Entry<Long, Integer> entry : affected.entrySet()) {
-				long regionId = entry.getKey();
-				int deletedBlocks = Math.max(1, entry.getValue());
-				upsertAuthor(regionId, actor, 0, deletedBlocks, now);
-				touchRegion(regionId, now);
-				markDirty(regionId, now);
-				refreshAuthorRatios(regionId);
-				refreshRiskFlags(regionId);
+			if (!affected.isEmpty()) {
+				deletePlacedBlocksInBounds(bounds, dimension);
+				for (Map.Entry<Long, Integer> entry : affected.entrySet()) {
+					long regionId = entry.getKey();
+					int deletedBlocks = Math.max(1, entry.getValue());
+					upsertAuthor(regionId, actor, 0, deletedBlocks, now);
+					touchRegion(regionId, now);
+					markDirty(regionId, now);
+					refreshAuthorRatios(regionId);
+					refreshRiskFlags(regionId);
+				}
+			}
+			if (structureAuditEnabled) {
+				StructureAuditEvent auditEvent = StructureAuditEvent.fromBounds(bounds, actor, source, changeType, changedBlocks, now);
+				if (auditEvent != null) {
+					insertStructureAuditEvent(auditEvent);
+				}
 			}
 			connection.commit();
 		} catch (SQLException e) {
@@ -273,6 +306,42 @@ public final class BuildingIndexStore {
 
 	public ExportManifest buildManifest(ExportJob job, WorldBlockReader reader, int maxExportVolumeBlocks) throws IOException {
 		return buildExportBundle(job, reader, maxExportVolumeBlocks).manifest;
+	}
+
+	public synchronized List<StructureAuditEvent> listPendingStructureAuditEvents(int limit) {
+		if (closed) return List.of();
+		int safeLimit = Math.max(1, Math.min(200, limit));
+		try (PreparedStatement ps = connection.prepareStatement("""
+			SELECT * FROM structure_audit_outbox
+			ORDER BY created_at ASC, event_id ASC
+			LIMIT ?
+			""")) {
+			ps.setInt(1, safeLimit);
+			try (ResultSet rs = ps.executeQuery()) {
+				List<StructureAuditEvent> out = new ArrayList<>();
+				while (rs.next()) out.add(StructureAuditEvent.fromResultSet(rs));
+				return out;
+			}
+		} catch (SQLException e) {
+			log.warn("Failed to list pending structure audit events: {}", e.toString());
+			return List.of();
+		}
+	}
+
+	public synchronized void deleteStructureAuditOutboxEvents(List<String> eventIds) {
+		if (closed || eventIds == null || eventIds.isEmpty()) return;
+		try (PreparedStatement ps = connection.prepareStatement(
+			"DELETE FROM structure_audit_outbox WHERE event_id = ?"
+		)) {
+			for (String id : eventIds) {
+				if (id == null || id.isBlank()) continue;
+				ps.setString(1, id.trim());
+				ps.addBatch();
+			}
+			ps.executeBatch();
+		} catch (SQLException e) {
+			log.warn("Failed to delete acked structure audit events: {}", e.toString());
+		}
 	}
 
 	public ExportBundle buildExportBundle(ExportJob job, WorldBlockReader reader, int maxExportVolumeBlocks) throws IOException {
@@ -490,6 +559,28 @@ public final class BuildingIndexStore {
 				""");
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_region_blocks_region ON region_blocks(region_id)");
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_region_blocks_dimension_xyz_region ON region_blocks(dimension, x, y, z, region_id)");
+			stmt.execute("""
+				CREATE TABLE IF NOT EXISTS structure_audit_outbox (
+					event_id TEXT PRIMARY KEY,
+					actor_name TEXT NOT NULL,
+					tool TEXT NOT NULL,
+					operation TEXT NOT NULL,
+					source TEXT NOT NULL,
+					change_type TEXT NOT NULL,
+					dimension TEXT NOT NULL,
+					min_x INTEGER NOT NULL,
+					min_y INTEGER NOT NULL,
+					min_z INTEGER NOT NULL,
+					max_x INTEGER NOT NULL,
+					max_y INTEGER NOT NULL,
+					max_z INTEGER NOT NULL,
+					changed_block_count INTEGER NOT NULL,
+					bounds_block_count INTEGER NOT NULL,
+					recorded_at TEXT NOT NULL,
+					created_at TEXT NOT NULL
+				)
+				""");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_structure_audit_outbox_created ON structure_audit_outbox(created_at)");
 		}
 	}
 
@@ -501,6 +592,38 @@ public final class BuildingIndexStore {
 		normalizeDatetimeColumn("region_authors", "last_touched_at");
 		normalizeDatetimeColumn("region_blocks", "first_placed_at");
 		normalizeDatetimeColumn("region_blocks", "last_touched_at");
+		normalizeDatetimeColumn("structure_audit_outbox", "recorded_at");
+		normalizeDatetimeColumn("structure_audit_outbox", "created_at");
+	}
+
+	private void insertStructureAuditEvent(StructureAuditEvent event) throws SQLException {
+		if (event == null) return;
+		try (PreparedStatement ps = connection.prepareStatement("""
+			INSERT OR IGNORE INTO structure_audit_outbox (
+				event_id, actor_name, tool, operation, source, change_type, dimension,
+				min_x, min_y, min_z, max_x, max_y, max_z,
+				changed_block_count, bounds_block_count, recorded_at, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			""")) {
+			ps.setString(1, event.eventId);
+			ps.setString(2, event.actorName);
+			ps.setString(3, event.tool);
+			ps.setString(4, event.operation);
+			ps.setString(5, event.source);
+			ps.setString(6, event.changeType);
+			ps.setString(7, event.dimension);
+			ps.setInt(8, event.minX);
+			ps.setInt(9, event.minY);
+			ps.setInt(10, event.minZ);
+			ps.setInt(11, event.maxX);
+			ps.setInt(12, event.maxY);
+			ps.setInt(13, event.maxZ);
+			ps.setInt(14, event.changedBlockCount);
+			ps.setInt(15, event.boundsBlockCount);
+			ps.setString(16, event.recordedAt);
+			ps.setString(17, SqliteUtcDatetimes.now());
+			ps.executeUpdate();
+		}
 	}
 
 	private void normalizeDatetimeColumn(String table, String column) throws SQLException {
@@ -967,6 +1090,16 @@ public final class BuildingIndexStore {
 		}
 	}
 
+	private int countPendingStructureAuditEvents() {
+		try (Statement stmt = connection.createStatement();
+			 ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM structure_audit_outbox")) {
+			return rs.next() ? rs.getInt(1) : 0;
+		} catch (SQLException e) {
+			log.warn("Failed to count pending structure audit events: {}", e.toString());
+			return 0;
+		}
+	}
+
 	private static List<List<BlockRecord>> connectedGroups(List<BlockRecord> blocks) throws IOException {
 		Map<BlockCoordinate, BlockRecord> byCoordinate = new HashMap<>();
 		for (BlockRecord block : blocks) {
@@ -1128,7 +1261,7 @@ public final class BuildingIndexStore {
 	}
 
 	private static String dimensionName(String raw) {
-		return raw == null || raw.isBlank() ? "minecraft:overworld" : raw.trim();
+		return DimensionNames.normalize(raw);
 	}
 
 	private static String displayActorName(String actorName) {

@@ -20,7 +20,7 @@ public final class BulkPlacementBounds {
 		int maxZ,
 		int blockCount
 	) {
-		this.dimension = dimension != null && !dimension.isBlank() ? dimension : "minecraft:overworld";
+		this.dimension = DimensionNames.normalize(dimension);
 		this.minX = Math.min(minX, maxX);
 		this.minY = Math.min(minY, maxY);
 		this.minZ = Math.min(minZ, maxZ);

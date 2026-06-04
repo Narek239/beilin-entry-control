@@ -25,14 +25,19 @@ public final class BeilinWsClientExportJobsTest {
 		);
 
 		List<WsExportJob> received = new ArrayList<>();
+		List<String> ackedStructureEvents = new ArrayList<>();
 		ExportJobsListener listener = received::addAll;
+		StructureAuditAckListener ackListener = ackedStructureEvents::addAll;
 		BeilinWsEvents.addExportJobsListener(listener);
+		BeilinWsEvents.addStructureAuditAckListener(ackListener);
 		try {
 			Method method = BeilinWsClient.class.getDeclaredMethod("handleTextMessage", String.class);
 			method.setAccessible(true);
 			method.invoke(client, "{\"action\":\"export_jobs\",\"jobs\":[{\"request_id\":11,\"minecraft_username\":\"Builder\",\"requested_at\":\"r\",\"reviewed_at\":\"v\"}]}");
+			method.invoke(client, "{\"action\":\"structure_audit_ack\",\"event_ids\":[\"audit-1\",\"audit-2\"]}");
 		} finally {
 			BeilinWsEvents.removeExportJobsListener(listener);
+			BeilinWsEvents.removeStructureAuditAckListener(ackListener);
 			client.stop();
 		}
 
@@ -42,6 +47,25 @@ public final class BeilinWsClientExportJobsTest {
 		WsExportJob job = received.get(0);
 		if (job.requestId != 11L || !"Builder".equals(job.minecraftUsername) || !"r".equals(job.requestedAt) || !"v".equals(job.reviewedAt)) {
 			throw new AssertionError("unexpected export job payload");
+		}
+		if (ackedStructureEvents.size() != 2 || !"audit-1".equals(ackedStructureEvents.get(0)) || !"audit-2".equals(ackedStructureEvents.get(1))) {
+			throw new AssertionError("structure audit ack was not dispatched");
+		}
+
+		List<String> sentAuditPayloads = new ArrayList<>();
+		BeilinWsEvents.setStructureAuditSender(text -> {
+			sentAuditPayloads.add(text);
+			return true;
+		});
+		try {
+			if (!BeilinWsEvents.sendStructureAuditEvents("{\"action\":\"structure_audit_events\",\"events\":[]}")) {
+				throw new AssertionError("structure audit sender did not report success");
+			}
+		} finally {
+			BeilinWsEvents.setStructureAuditSender(null);
+		}
+		if (sentAuditPayloads.size() != 1 || !sentAuditPayloads.get(0).contains("structure_audit_events")) {
+			throw new AssertionError("structure audit sender did not receive payload");
 		}
 
 		List<WsExportJob> cached = new ArrayList<>();

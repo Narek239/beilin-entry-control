@@ -20,7 +20,7 @@ public final class BulkBlockChange {
 		boolean oldBlockReplaceable,
 		boolean forcePlacement
 	) {
-		this.dimension = dimension != null && !dimension.isBlank() ? dimension : "minecraft:overworld";
+		this.dimension = DimensionNames.normalize(dimension);
 		this.x = x;
 		this.y = y;
 		this.z = z;

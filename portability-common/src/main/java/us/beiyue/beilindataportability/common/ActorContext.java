@@ -21,40 +21,44 @@ public final class ActorContext {
 
 	public static Scope push(String actorName, String source) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null));
+		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null, null));
 		return new Scope(previous);
 	}
 
 	public static Scope pushNear(String actorName, String source, int x, int y, int z) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), x, y, z, DEFAULT_BLOCK_ACTION_RADIUS, RecordingMode.NORMAL, null, null));
+		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), x, y, z, DEFAULT_BLOCK_ACTION_RADIUS, RecordingMode.NORMAL, null, null, null));
 		return new Scope(previous);
 	}
 
 	public static Scope pushBulkRecord(String actorName, String source, Consumer<Actor> flush) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_RECORD, null, flush));
+		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_RECORD, null, null, flush));
 		return new Scope(previous);
 	}
 
 	public static Scope pushBulkDeleteBounds(String actorName, String source, BulkPlacementBounds bounds, Consumer<Actor> flush) {
+		return pushBulkDeleteBounds(actorName, source, bounds, "delete", flush);
+	}
+
+	public static Scope pushBulkDeleteBounds(String actorName, String source, BulkPlacementBounds bounds, String changeType, Consumer<Actor> flush) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_DELETE_BOUNDS, bounds, flush));
+		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_DELETE_BOUNDS, bounds, changeTypeName(changeType), flush));
 		return new Scope(previous);
 	}
 
 	public static Scope pushBulkIgnore(String actorName, String source) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_IGNORE, null, null));
+		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_IGNORE, null, null, null));
 		return new Scope(previous);
 	}
 
 	public static Actor system(String source) {
-		return new Actor(SYSTEM_ACTOR, sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null);
+		return new Actor(SYSTEM_ACTOR, sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null, null);
 	}
 
 	public static Actor unknown(String source) {
-		return new Actor(UNKNOWN_ACTOR, sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null);
+		return new Actor(UNKNOWN_ACTOR, sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null, null);
 	}
 
 	public static String normalizeName(String name) {
@@ -69,6 +73,13 @@ public final class ActorContext {
 	private static String sourceName(String source) {
 		if (source == null || source.isBlank()) return "UNKNOWN";
 		return source.trim();
+	}
+
+	private static String changeTypeName(String changeType) {
+		if (changeType == null || changeType.isBlank()) return "mixed";
+		String value = changeType.trim().toLowerCase(Locale.ROOT);
+		if ("place".equals(value) || "delete".equals(value) || "mixed".equals(value)) return value;
+		return "mixed";
 	}
 
 	public static final class Scope implements AutoCloseable {
@@ -115,6 +126,7 @@ public final class ActorContext {
 		private final Integer originZ;
 		private final int radius;
 		private final BulkPlacementBounds bulkBounds;
+		private final String bulkChangeType;
 		private final Consumer<Actor> bulkFlush;
 		private final List<BulkBlockChange> bulkChanges = new ArrayList<>();
 
@@ -127,6 +139,7 @@ public final class ActorContext {
 			int radius,
 			RecordingMode recordingMode,
 			BulkPlacementBounds bulkBounds,
+			String bulkChangeType,
 			Consumer<Actor> bulkFlush
 		) {
 			this.name = name;
@@ -138,6 +151,7 @@ public final class ActorContext {
 			this.radius = Math.max(0, radius);
 			this.recordingMode = recordingMode != null ? recordingMode : RecordingMode.NORMAL;
 			this.bulkBounds = bulkBounds;
+			this.bulkChangeType = changeTypeName(bulkChangeType);
 			this.bulkFlush = bulkFlush;
 		}
 
@@ -169,6 +183,10 @@ public final class ActorContext {
 
 		public BulkPlacementBounds bulkBounds() {
 			return bulkBounds;
+		}
+
+		public String bulkChangeType() {
+			return bulkChangeType;
 		}
 
 		public List<BulkBlockChange> bulkChanges() {
