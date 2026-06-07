@@ -130,6 +130,20 @@ public final class BulkPlacementIntrospection {
 		return isWorldEditAirState(block) || isWorldEditAirState(pattern);
 	}
 
+	public static boolean isWorldEditConstantBlockPattern(Object pattern) {
+		return pattern != null && invoke(pattern, "getBlockType") != null;
+	}
+
+	public static boolean isWorldEditCuboidRegion(Object region) {
+		if (region == null) return false;
+		Class<?> type = region.getClass();
+		while (type != null) {
+			if ("com.sk89q.worldedit.regions.CuboidRegion".equals(type.getName())) return true;
+			type = type.getSuperclass();
+		}
+		return false;
+	}
+
 	public static String worldEditDimension(Object editSession) {
 		Object worldEditWorld = invoke(editSession, "getWorld");
 		return worldEditWorldDimension(worldEditWorld);

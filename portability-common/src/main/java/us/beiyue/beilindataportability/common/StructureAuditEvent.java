@@ -73,37 +73,70 @@ public final class StructureAuditEvent {
 		String recordedAt
 	) {
 		if (changes == null || changes.isEmpty()) return List.of();
-		Map<String, MutableSummary> summaries = new LinkedHashMap<>();
+		Accumulator accumulator = new Accumulator(actorName, source);
 		for (BulkBlockChange change : changes) {
-			if (change == null) continue;
-			String dimension = DimensionNames.normalize(change.dimension);
-			MutableSummary summary = summaries.computeIfAbsent(dimension, MutableSummary::new);
-			summary.include(change);
+			accumulator.include(change);
 		}
-		List<StructureAuditEvent> out = new ArrayList<>();
-		ToolOperation parsed = parseSource(source);
-		for (MutableSummary summary : summaries.values()) {
-			if (summary.count <= 0) continue;
-			out.add(new StructureAuditEvent(
-				UUID.randomUUID().toString(),
-				actorName,
-				parsed.tool,
-				parsed.operation,
-				source,
-				summary.changeType(),
-				summary.dimension,
-				summary.minX,
-				summary.minY,
-				summary.minZ,
-				summary.maxX,
-				summary.maxY,
-				summary.maxZ,
-				summary.count,
-				summary.volume(),
-				recordedAt
-			));
+		return accumulator.toEvents(recordedAt);
+	}
+
+	public static Accumulator accumulator(String actorName, String source) {
+		return new Accumulator(actorName, source);
+	}
+
+	public static final class Accumulator {
+		private final String actorName;
+		private final String source;
+		private final Map<String, MutableSummary> summaries = new LinkedHashMap<>();
+
+		private Accumulator(String actorName, String source) {
+			this.actorName = actorName;
+			this.source = source;
 		}
-		return out;
+
+		public void include(BulkBlockChange change) {
+			if (change == null) return;
+			include(change.dimension, change.x, change.y, change.z, change.newBlockState);
+		}
+
+		public void include(String dimension, int x, int y, int z, String newBlockState) {
+			String normalizedDimension = DimensionNames.normalize(dimension);
+			MutableSummary summary = summaries.computeIfAbsent(normalizedDimension, MutableSummary::new);
+			summary.include(x, y, z, newBlockState);
+		}
+
+		public List<StructureAuditEvent> toEvents(String recordedAt) {
+			return toEvents(recordedAt, -1);
+		}
+
+		public List<StructureAuditEvent> toEvents(String recordedAt, int resultChangedBlockCount) {
+			if (summaries.isEmpty()) return List.of();
+			List<StructureAuditEvent> out = new ArrayList<>();
+			ToolOperation parsed = parseSource(source);
+			boolean useResultCount = resultChangedBlockCount >= 0 && summaries.size() == 1;
+			for (MutableSummary summary : summaries.values()) {
+				if (summary.count <= 0) continue;
+				out.add(new StructureAuditEvent(
+					UUID.randomUUID().toString(),
+					actorName,
+					parsed.tool,
+					parsed.operation,
+					source,
+					summary.changeType(),
+					summary.dimension,
+					summary.minX,
+					summary.minY,
+					summary.minZ,
+					summary.maxX,
+					summary.maxY,
+					summary.maxZ,
+					useResultCount ? resultChangedBlockCount : summary.count,
+					summary.volume(),
+					recordedAt
+				));
+			}
+			return out;
+		}
 	}
 
 	public static StructureAuditEvent fromBounds(
@@ -133,7 +166,7 @@ public final class StructureAuditEvent {
 			bounds.maxX,
 			bounds.maxY,
 			bounds.maxZ,
-			changedBlockCount > 0 ? changedBlockCount : volume,
+			changedBlockCount >= 0 ? changedBlockCount : volume,
 			volume,
 			recordedAt
 		);
@@ -247,15 +280,15 @@ public final class StructureAuditEvent {
 			this.dimension = dimension;
 		}
 
-		void include(BulkBlockChange change) {
-			minX = Math.min(minX, change.x);
-			minY = Math.min(minY, change.y);
-			minZ = Math.min(minZ, change.z);
-			maxX = Math.max(maxX, change.x);
-			maxY = Math.max(maxY, change.y);
-			maxZ = Math.max(maxZ, change.z);
+		void include(int x, int y, int z, String newBlockState) {
+			minX = Math.min(minX, x);
+			minY = Math.min(minY, y);
+			minZ = Math.min(minZ, z);
+			maxX = Math.max(maxX, x);
+			maxY = Math.max(maxY, y);
+			maxZ = Math.max(maxZ, z);
 			count += 1;
-			if (isAirState(change.newBlockState)) hasDelete = true;
+			if (isAirState(newBlockState)) hasDelete = true;
 			else hasPlace = true;
 		}
 

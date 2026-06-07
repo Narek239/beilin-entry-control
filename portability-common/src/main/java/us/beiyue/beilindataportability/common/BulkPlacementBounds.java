@@ -34,6 +34,10 @@ public final class BulkPlacementBounds {
 		return BulkPlacementShape.fromBounds(minX, minY, minZ, maxX, maxY, maxZ, blockCount);
 	}
 
+	public int volumeBlockCount() {
+		return BulkPlacementShape.fromBounds(minX, minY, minZ, maxX, maxY, maxZ).blockCount;
+	}
+
 	public boolean isLinearInfrastructure() {
 		return shape().isLinearInfrastructure();
 	}

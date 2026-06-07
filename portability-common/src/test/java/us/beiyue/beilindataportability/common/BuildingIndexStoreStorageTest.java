@@ -11,6 +11,10 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 public final class BuildingIndexStoreStorageTest {
@@ -86,13 +90,21 @@ public final class BuildingIndexStoreStorageTest {
 					SELECT COUNT(*) FROM region_blocks
 					WHERE first_placed_at LIKE '%T%' OR last_touched_at LIKE '%T%'
 					"""), "placed block datetimes should be normalized");
-				}
-				assertRecordingSemantics(dir);
-				assertStructureAuditSwitch(dir);
-				assertBoundsDeletion(dir);
-				assertNonLinearBoundsDeletion(dir);
-				assertDimensionNormalization();
-				assertGeometryClassifier();
+			}
+			assertRecordingSemantics(dir);
+			assertCompleteBoundsPlacement(dir);
+			assertStructureAuditSwitch(dir);
+			assertBoundsDeletion(dir);
+			assertNonLinearBoundsDeletion(dir);
+			assertLinearBoundsAuditCounts(dir);
+			assertNonLinearWorldEditResultAudit(dir);
+			assertAuditCountPriority(dir);
+			assertQueuedSingleBlockWrites(dir);
+			assertCompleteBoundsCaptureMode();
+			assertWorldEditCuboidDetection();
+			assertScopeAbortRestoresContext();
+			assertDimensionNormalization();
+			assertGeometryClassifier();
 		} finally {
 			if (store != null) {
 				store.close();
@@ -154,7 +166,7 @@ public final class BuildingIndexStoreStorageTest {
 			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 5"), "bulk DELETE_BOUNDS should not collect coordinates");
 			assertEquals(2, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox"), "bulk record/delete should enqueue two structure audit summaries");
 			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE tool = 'WORLDEDIT' AND operation = 'SET' AND change_type = 'place' AND changed_block_count = 1"), "bulk placement audit should summarize accepted coordinates");
-			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE tool = 'WORLDEDIT' AND operation = 'SET' AND change_type = 'delete' AND changed_block_count = 1"), "bulk delete audit should prefer actual indexed deletion count");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE tool = 'WORLDEDIT' AND operation = 'SET' AND change_type = 'delete' AND changed_block_count = 1"), "bulk delete audit without a result should use bounds volume");
 			assertEquals(2, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE dimension = 'minecraft:overworld'"), "bulk audit dimensions should be canonicalized");
 			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE dimension LIKE 'world%minecraft:%'"), "WorldEdit Fabric world id should not leak into audit dimensions");
 		}
@@ -193,21 +205,118 @@ public final class BuildingIndexStoreStorageTest {
 			store.recordBulkStateChanges(changes, "Alice", "WORLDEDIT_SET");
 			store.recordPlaced("minecraft:overworld", 1, 64, 0, "minecraft:stone", "Alice");
 			store.recordPlaced("minecraft:overworld", 2, 64, 0, "minecraft:stone", "Alice");
-			store.deleteIndexedBlocksInBounds(
-				new BulkPlacementBounds("minecraft:overworld", 1, 64, 0, 1, 64, 0, 1),
-				"Alice",
-				"WORLDEDIT_CUT"
-			);
-			assertTrue(store.diagnosticSummary().contains("structure_audit=disabled"), "diagnostics should show disabled structure audit");
+				store.deleteIndexedBlocksInBounds(
+					new BulkPlacementBounds("minecraft:overworld", 1, 64, 0, 1, 64, 0, 1),
+					"Alice",
+					"WORLDEDIT_CUT"
+				);
+				assertTrue(
+					store.tryRecordCompleteBoundsPlacement(
+						new BulkPlacementBounds("minecraft:overworld", 10, 64, 0, 12, 66, 2, 27),
+						"Alice",
+						"WORLDEDIT_SET",
+						27
+					),
+					"disabled audit should not disable the complete bounds index fast path"
+				);
+				assertTrue(store.diagnosticSummary().contains("structure_audit=disabled"), "diagnostics should show disabled structure audit");
 		} finally {
 			store.close();
 		}
 		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
 			 Statement s = c.createStatement()) {
 			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 0"), "disabled audit should still record bulk placements");
-			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 1"), "disabled audit should still apply bounds deletion");
-			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 2"), "disabled audit should preserve coordinates outside bounds deletion");
-			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox"), "disabled audit should not enqueue structure audit events");
+				assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 1"), "disabled audit should still apply bounds deletion");
+				assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 2"), "disabled audit should preserve coordinates outside bounds deletion");
+				assertEquals(27, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x BETWEEN 10 AND 12"), "disabled audit should still populate complete bounds coordinates");
+				assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox"), "disabled audit should not enqueue structure audit events");
+		}
+	}
+
+	private static void assertCompleteBoundsPlacement(Path dir) throws Exception {
+		Path db = dir.resolve("complete-bounds.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		BulkPlacementBounds bounds = new BulkPlacementBounds(
+			"world__minecraft:overworld",
+			10,
+			64,
+			20,
+			1109,
+			76,
+			20,
+			14_300
+		);
+		BulkPlacementBounds partialBounds = new BulkPlacementBounds(
+			"minecraft:overworld",
+			1_200,
+			64,
+			20,
+			1_219,
+			64,
+			39,
+			400
+		);
+		BulkPlacementBounds zeroResultBounds = new BulkPlacementBounds(
+			"minecraft:overworld",
+			1_300,
+			64,
+			20,
+			1_319,
+			64,
+			39,
+			400
+		);
+		try {
+			store.recordPlaced("minecraft:overworld", 10, 64, 20, "minecraft:stone", "Alice");
+			assertTrue(
+				store.tryRecordCompleteBoundsPlacement(bounds, "Alice", "WORLDEDIT_SET", 14_300),
+				"complete non-linear //set bounds should use the set-based fast path"
+			);
+			assertTrue(
+				store.tryRecordCompleteBoundsPlacement(partialBounds, "Alice", "WORLDEDIT_SET", 17),
+				"partial //set result should still use the bounds fast path"
+			);
+			assertTrue(
+				store.tryRecordCompleteBoundsPlacement(zeroResultBounds, "Alice", "WORLDEDIT_SET", 0),
+				"zero-result //set should still use the bounds fast path"
+			);
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(15_100, scalarInt(s, "SELECT COUNT(*) FROM region_blocks"), "bounds fast paths should insert every coordinate once");
+			assertEquals(3, scalarInt(s, "SELECT COUNT(*) FROM building_regions"), "separate bounds should remain separate regions");
+			assertEquals(15_100, scalarInt(s, "SELECT SUM(volume_blocks) FROM building_regions"), "region bounds should retain all cuboid volumes");
+			assertEquals(15_101, scalarInt(s, "SELECT SUM(first_place_count) FROM region_authors WHERE player_name_key = 'alice'"), "bounds should aggregate author placement counts");
+			assertEquals(15_101, scalarInt(s, "SELECT SUM(last_modify_count) FROM region_authors WHERE player_name_key = 'alice'"), "bounds should aggregate author modification counts");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_SET'
+				  AND changed_block_count = 14300
+				  AND bounds_block_count = 14300
+				  AND min_x = 10 AND max_x = 1109
+				  AND min_y = 64 AND max_y = 76
+				  AND min_z = 20 AND max_z = 20
+				"""), "complete bounds should enqueue one exact audit summary");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_SET'
+				  AND changed_block_count = 17
+				  AND bounds_block_count = 400
+				  AND min_x = 1200 AND max_x = 1219
+				  AND min_y = 64 AND max_y = 64
+				  AND min_z = 20 AND max_z = 39
+				"""), "partial result should retain its exact audit count while indexing the full bounds");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_SET'
+				  AND changed_block_count = 0
+				  AND bounds_block_count = 400
+				  AND min_x = 1300 AND max_x = 1319
+				  AND min_y = 64 AND max_y = 64
+				  AND min_z = 20 AND max_z = 39
+				"""), "zero result should retain its audit count while indexing the full bounds");
 		}
 	}
 
@@ -278,7 +387,363 @@ public final class BuildingIndexStoreStorageTest {
 			 Statement s = c.createStatement()) {
 			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x BETWEEN 20 AND 39 AND z BETWEEN 0 AND 19"), "non-linear bounds delete should not depend on linear geometry");
 			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 40 AND z = 20"), "non-linear bounds delete should preserve indexed blocks outside range");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'EFFORTLESS_BREAK'
+				  AND changed_block_count = 400
+				  AND bounds_block_count = 400
+				"""), "delete audit without a result should use bounds volume instead of the two indexed blocks");
 		}
+	}
+
+	private static void assertLinearBoundsAuditCounts(Path dir) throws Exception {
+		Path db = dir.resolve("linear-bounds-audit.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			store.deleteIndexedBlocksInBounds(
+				new BulkPlacementBounds("minecraft:overworld", 0, 64, 0, 99, 64, 0, 100),
+				"Alice",
+				"WORLDEDIT_SET",
+				"mixed",
+				37
+			);
+			store.deleteIndexedBlocksInBounds(
+				new BulkPlacementBounds("minecraft:overworld", 200, 64, 0, 299, 64, 0, 100),
+				"Alice",
+				"WORLDEDIT_REPLACE",
+				"mixed",
+				0
+			);
+			store.deleteIndexedBlocksInBounds(
+				new BulkPlacementBounds("minecraft:overworld", 400, 64, 0, 409, 64, 0, 10),
+				"Alice",
+				"EFFORTLESS_BUILD",
+				"mixed"
+			);
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_SET' AND changed_block_count = 37 AND bounds_block_count = 100
+				"""), "linear WorldEdit set audit should use the command result");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_REPLACE' AND changed_block_count = 0 AND bounds_block_count = 100
+				"""), "zero WorldEdit result should remain an exact audit count");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'EFFORTLESS_BUILD' AND changed_block_count = 10 AND bounds_block_count = 10
+				"""), "bulk operations without a result should fall back to bounds volume");
+		}
+	}
+
+	private static void assertNonLinearWorldEditResultAudit(Path dir) throws Exception {
+		Path db = dir.resolve("non-linear-result-audit.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			List<BulkBlockChange> capturedChanges = List.of(
+				new BulkBlockChange(
+					"minecraft:overworld",
+					0,
+					64,
+					0,
+					"minecraft:air",
+					"minecraft:stone",
+					true,
+					true
+				),
+				new BulkBlockChange(
+					"minecraft:overworld",
+					1,
+					64,
+					0,
+					"minecraft:air",
+					"minecraft:stone",
+					true,
+					true
+				)
+			);
+			store.recordBulkStateChanges(
+				capturedChanges,
+				"Alice",
+				"WORLDEDIT_REPLACE",
+				new BulkPlacementBounds("minecraft:overworld", 0, 64, 0, 19, 64, 19, 400),
+				17
+			);
+			store.recordBulkStateChanges(
+				List.of(),
+				"Alice",
+				"WORLDEDIT_SET",
+				new BulkPlacementBounds("minecraft:overworld", 30, 64, 0, 49, 64, 19, 400),
+				0
+			);
+			store.recordBulkStateChanges(
+				List.of(new BulkBlockChange(
+					"minecraft:overworld",
+					60,
+					64,
+					0,
+					"minecraft:air",
+					"minecraft:stone",
+					true,
+					true
+				)),
+				"Alice",
+				"WORLDEDIT_SET",
+				null,
+				9
+			);
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(3, scalarInt(s, "SELECT COUNT(*) FROM region_blocks"), "non-linear indexing should still use captured coordinates");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_REPLACE'
+				  AND changed_block_count = 17
+				  AND bounds_block_count = 400
+				  AND change_type = 'place'
+				"""), "non-linear replace audit should use the WorldEdit result instead of captured coordinate count");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_SET'
+				  AND changed_block_count = 0
+				  AND bounds_block_count = 400
+				"""), "zero-result non-linear set should still enqueue an exact audit event");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_SET'
+				  AND changed_block_count = 9
+				  AND bounds_block_count = 1
+				  AND min_x = 60 AND max_x = 60
+				"""), "a WorldEdit result should take priority over the captured count");
+		}
+	}
+
+	private static void assertAuditCountPriority(Path dir) throws Exception {
+		Path db = dir.resolve("audit-count-priority.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			List<BulkBlockChange> capturedChanges = List.of(
+				capturedPlacement(0),
+				capturedPlacement(1)
+			);
+			store.recordBulkStateChanges(
+				capturedChanges,
+				"Alice",
+				"EFFORTLESS_CAPTURED",
+				new BulkPlacementBounds("minecraft:overworld", 0, 64, 0, 19, 64, 19, 400),
+				-1
+			);
+			store.recordBulkStateChanges(
+				List.of(capturedPlacement(60)),
+				"Alice",
+				"EFFORTLESS_CAPTURED_NO_BOUNDS",
+				null,
+				-1
+			);
+			store.recordBulkStateChanges(
+				List.of(capturedPlacement(90)),
+				"Alice",
+				"WORLDEDIT_SET",
+				new BulkPlacementBounds("minecraft:overworld", 90, 64, 0, 109, 64, 19, 400),
+				7
+			);
+			store.recordBulkStateChanges(
+				List.of(),
+				"Alice",
+				"EFFORTLESS_BOUNDS_ONLY",
+				new BulkPlacementBounds("minecraft:overworld", 120, 64, 0, 139, 64, 19, 400),
+				-1
+			);
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(4, scalarInt(s, "SELECT COUNT(*) FROM region_blocks"), "audit count selection should not discard captured index coordinates");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'EFFORTLESS_CAPTURED'
+				  AND changed_block_count = 2
+				  AND bounds_block_count = 400
+				"""), "missing result should use the captured count with the available bounds");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'EFFORTLESS_CAPTURED_NO_BOUNDS'
+				  AND changed_block_count = 1
+				  AND bounds_block_count = 1
+				"""), "captured coordinates should provide the count and range when bounds are unavailable");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_SET'
+				  AND changed_block_count = 7
+				  AND bounds_block_count = 400
+				"""), "WorldEdit result should override the captured count");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'EFFORTLESS_BOUNDS_ONLY'
+				  AND changed_block_count = 400
+				  AND bounds_block_count = 400
+				"""), "missing result and capture should fall back to the bounds count");
+		}
+	}
+
+	private static void assertQueuedSingleBlockWrites(Path dir) throws Exception {
+		Path db = dir.resolve("queued-single-block-writes.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		ExecutorService caller = Executors.newSingleThreadExecutor();
+		try {
+			synchronized (store) {
+				Future<?> accepted = caller.submit(() -> store.recordStateChangeWithSource(
+					"minecraft:overworld",
+					30,
+					64,
+					30,
+					"minecraft:air",
+					"minecraft:stone",
+					"Alice",
+					"PLAYER_USE_ITEM_ON"
+				));
+				accepted.get(1, TimeUnit.SECONDS);
+			}
+			for (int y = 64; y < 69; y++) {
+				for (int z = 0; z < 5; z++) {
+					for (int x = 0; x < 5; x++) {
+						store.recordStateChangeWithSource(
+							"minecraft:overworld",
+							x,
+							y,
+							z,
+							"minecraft:air",
+							"minecraft:stone",
+							"Alice",
+							"PLAYER_USE_ITEM_ON"
+						);
+					}
+				}
+			}
+			store.recordStateChangeWithSource("minecraft:overworld", 20, 64, 20, "minecraft:air", "minecraft:stone", "Alice", "PLAYER_USE_ITEM_ON");
+			store.recordStateChangeWithSource("minecraft:overworld", 20, 64, 20, "minecraft:stone", "minecraft:air", "Alice", "PLAYER_DESTROY_BLOCK");
+			store.recordStateChangeWithSource("minecraft:overworld", 20, 64, 20, "minecraft:air", "minecraft:stone", "Alice", "PLAYER_USE_ITEM_ON");
+			store.flushPendingWrites();
+
+			try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+				 Statement s = c.createStatement()) {
+				assertEquals(127, scalarInt(s, "SELECT COUNT(*) FROM region_blocks"), "queued single-block writes should be visible after the flush barrier");
+				assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 20 AND y = 64 AND z = 20"), "queued mutation order should preserve the final placement");
+				assertEquals(128, scalarInt(s, "SELECT SUM(first_place_count) FROM region_authors WHERE player_name_key = 'alice'"), "queued author placement counts should retain every accepted placement");
+				assertEquals(129, scalarInt(s, "SELECT SUM(last_modify_count) FROM region_authors WHERE player_name_key = 'alice'"), "queued author modification counts should retain placement and deletion order");
+			}
+		} finally {
+			caller.shutdownNow();
+			store.close();
+		}
+	}
+
+	private static BulkBlockChange capturedPlacement(int x) {
+		return new BulkBlockChange(
+			"minecraft:overworld",
+			x,
+			64,
+			0,
+			"minecraft:air",
+			"minecraft:stone",
+			true,
+			true
+		);
+	}
+
+	private static void assertCompleteBoundsCaptureMode() {
+		BulkPlacementBounds bounds = new BulkPlacementBounds(
+			"minecraft:overworld",
+			0,
+			64,
+			0,
+			9,
+			73,
+			9,
+			1_000
+		);
+		int[] flushedChanges = {-1};
+		try (ActorContext.Scope scope = ActorContext.pushBulkRecord(
+			"Alice",
+			"WORLDEDIT_SET",
+			bounds,
+			true,
+			actor -> flushedChanges[0] = actor.bulkChanges().size()
+		)) {
+			ActorContext.Actor actor = ActorContext.current();
+			assertEquals(ActorContext.RecordingMode.BULK_COMPLETE_BOUNDS, actor.recordingMode, "complete bounds mode should be selected before block updates begin");
+			assertTrue(actor.shouldIgnoreBlockRecords(), "complete bounds mode should suppress per-block capture");
+			assertFalse(actor.shouldForcePlacementRecords(), "complete bounds mode should not create BulkBlockChange objects");
+			actor.addBulkChange(capturedPlacement(0));
+			assertEquals(0, actor.bulkChanges().size(), "complete bounds mode should keep the bulk buffer empty");
+			actor.setBulkResultCount(1_000);
+			assertTrue(actor.isCompleteBoundsPlacement(), "matching result count should enable the complete bounds SQL path");
+		}
+		assertEquals(0, flushedChanges[0], "complete bounds flush should not receive captured block objects");
+
+		try (ActorContext.Scope scope = ActorContext.pushBulkRecord(
+			"Alice",
+			"WORLDEDIT_SET",
+			bounds,
+			true,
+			actor -> {
+			}
+		)) {
+			ActorContext.Actor actor = ActorContext.current();
+			actor.setBulkResultCount(999);
+			assertTrue(actor.isCompleteBoundsPlacement(), "partial results should retain the complete-bounds SQL path");
+			assertEquals(0, actor.bulkChanges().size(), "complete-bounds mode should remain summary-only");
+		}
+
+		try (ActorContext.Scope scope = ActorContext.pushBulkRecord(
+			"Alice",
+			"WORLDEDIT_SET",
+			null,
+			true,
+			actor -> {
+			}
+		)) {
+			assertEquals(ActorContext.RecordingMode.BULK_RECORD, ActorContext.current().recordingMode, "missing bounds should retain coordinate capture");
+		}
+	}
+
+	private static void assertWorldEditCuboidDetection() {
+		assertTrue(
+			BulkPlacementIntrospection.isWorldEditCuboidRegion(new com.sk89q.worldedit.regions.CuboidRegion()),
+			"WorldEdit CuboidRegion should be eligible for complete-bounds capture"
+		);
+		assertTrue(
+			BulkPlacementIntrospection.isWorldEditCuboidRegion(new FakeDerivedCuboidRegion()),
+			"CuboidRegion subclasses should be eligible for complete-bounds capture"
+		);
+		assertFalse(
+			BulkPlacementIntrospection.isWorldEditCuboidRegion(new FakeWorldEditWorld("world", "world")),
+			"non-cuboid WorldEdit regions should not use complete-bounds capture"
+		);
+		assertFalse(
+			BulkPlacementIntrospection.isWorldEditCuboidRegion(null),
+			"missing WorldEdit region should not use complete-bounds capture"
+		);
+	}
+
+	private static void assertScopeAbortRestoresContext() {
+		int[] flushCalls = {0};
+		try (ActorContext.Scope outer = ActorContext.push("Outer", "TEST")) {
+			ActorContext.Scope bulk = ActorContext.pushBulkRecord("Alice", "WORLDEDIT_SET", actor -> flushCalls[0]++);
+			assertEquals("Alice", ActorContext.current().name, "bulk scope should install its actor");
+			bulk.abort();
+			assertEquals("Outer", ActorContext.current().name, "aborted bulk scope should restore the previous actor");
+			assertEquals(0, flushCalls[0], "aborted bulk scope should not flush partial changes");
+		}
+		assertEquals(null, ActorContext.current(), "closing the outer scope should clear the ThreadLocal");
 	}
 
 	private static void assertGeometryClassifier() {
@@ -414,6 +879,9 @@ public final class BuildingIndexStoreStorageTest {
 		public String getId() {
 			return id;
 		}
+	}
+
+	private static final class FakeDerivedCuboidRegion extends com.sk89q.worldedit.regions.CuboidRegion {
 	}
 
 	private static final class FakeWorldReader implements WorldBlockReader {

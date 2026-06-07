@@ -1,72 +1,62 @@
 package us.beiyue.beilindataportability.platform.fabric1201.mixin;
 
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.sk89q.worldedit.LocalSession;
 import com.sk89q.worldedit.extension.platform.Actor;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import us.beiyue.beilindataportability.common.ActorContext;
 import us.beiyue.beilindataportability.platform.fabric1201.BlockChangeRecorder1201;
 
 @Mixin(targets = "com.sk89q.worldedit.command.HistoryCommands", remap = false)
 abstract class WorldEditHistoryCommandsMixin {
-	@Inject(
+	@WrapMethod(
 		method = "undo(Lcom/sk89q/worldedit/extension/platform/Actor;Lcom/sk89q/worldedit/LocalSession;ILjava/lang/String;)V",
-		at = @At("HEAD"),
 		remap = false
 	)
-	private void beilinEntryPortability$beginWorldEditUndo(
+	private void beilinEntryPortability$wrapWorldEditUndo(
 		Actor actor,
 		LocalSession session,
 		int times,
 		String playerName,
-		CallbackInfo ci
+		Operation<Void> original
 	) {
-		BlockChangeRecorder1201.pushBulkScope(BlockChangeRecorder1201.beginWorldEditHistory(actor, "WORLDEDIT_UNDO"));
+		ActorContext.Scope scope = BlockChangeRecorder1201.beginWorldEditHistory(actor, "WORLDEDIT_UNDO");
+		boolean completed = false;
+		try {
+			original.call(actor, session, times, playerName);
+			completed = true;
+		} finally {
+			if (completed) {
+				BlockChangeRecorder1201.completeBulkScope(scope);
+			} else {
+				BlockChangeRecorder1201.abortBulkScope(scope);
+			}
+		}
 	}
 
-	@Inject(
-		method = "undo(Lcom/sk89q/worldedit/extension/platform/Actor;Lcom/sk89q/worldedit/LocalSession;ILjava/lang/String;)V",
-		at = @At("RETURN"),
-		remap = false
-	)
-	private void beilinEntryPortability$endWorldEditUndo(
-		Actor actor,
-		LocalSession session,
-		int times,
-		String playerName,
-		CallbackInfo ci
-	) {
-		BlockChangeRecorder1201.closeBulkScope();
-	}
-
-	@Inject(
+	@WrapMethod(
 		method = "redo(Lcom/sk89q/worldedit/extension/platform/Actor;Lcom/sk89q/worldedit/LocalSession;ILjava/lang/String;)V",
-		at = @At("HEAD"),
 		remap = false
 	)
-	private void beilinEntryPortability$beginWorldEditRedo(
+	private void beilinEntryPortability$wrapWorldEditRedo(
 		Actor actor,
 		LocalSession session,
 		int times,
 		String playerName,
-		CallbackInfo ci
+		Operation<Void> original
 	) {
-		BlockChangeRecorder1201.pushBulkScope(BlockChangeRecorder1201.beginWorldEditHistory(actor, "WORLDEDIT_REDO"));
-	}
-
-	@Inject(
-		method = "redo(Lcom/sk89q/worldedit/extension/platform/Actor;Lcom/sk89q/worldedit/LocalSession;ILjava/lang/String;)V",
-		at = @At("RETURN"),
-		remap = false
-	)
-	private void beilinEntryPortability$endWorldEditRedo(
-		Actor actor,
-		LocalSession session,
-		int times,
-		String playerName,
-		CallbackInfo ci
-	) {
-		BlockChangeRecorder1201.closeBulkScope();
+		ActorContext.Scope scope = BlockChangeRecorder1201.beginWorldEditHistory(actor, "WORLDEDIT_REDO");
+		boolean completed = false;
+		try {
+			original.call(actor, session, times, playerName);
+			completed = true;
+		} finally {
+			if (completed) {
+				BlockChangeRecorder1201.completeBulkScope(scope);
+			} else {
+				BlockChangeRecorder1201.abortBulkScope(scope);
+			}
+		}
 	}
 }

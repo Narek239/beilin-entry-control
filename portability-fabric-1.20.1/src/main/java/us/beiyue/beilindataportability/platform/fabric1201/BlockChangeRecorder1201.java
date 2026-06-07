@@ -20,8 +20,6 @@ public final class BlockChangeRecorder1201 {
 	private static volatile boolean discardLinearBulkPlacements = true;
 	private static final ThreadLocal<ArrayDeque<BlockState>> OLD_STATES = ThreadLocal.withInitial(ArrayDeque::new);
 	private static final ThreadLocal<ArrayDeque<Boolean>> OLD_STATE_CAPTURED = ThreadLocal.withInitial(ArrayDeque::new);
-	private static final ThreadLocal<ArrayDeque<ActorContext.Scope>> BULK_SCOPES = ThreadLocal.withInitial(ArrayDeque::new);
-	private static final ThreadLocal<ArrayDeque<Boolean>> BULK_SCOPE_PRESENT = ThreadLocal.withInitial(ArrayDeque::new);
 
 	private BlockChangeRecorder1201() {
 	}
@@ -64,18 +62,21 @@ public final class BlockChangeRecorder1201 {
 		return capturedOldState && !oldStates.isEmpty() ? oldStates.pop() : null;
 	}
 
-	public static void pushBulkScope(ActorContext.Scope scope) {
-		BULK_SCOPE_PRESENT.get().push(scope != null);
-		if (scope != null) {
-			BULK_SCOPES.get().push(scope);
-		}
+	public static void completeBulkScope(ActorContext.Scope scope) {
+		completeBulkScope(scope, null);
 	}
 
-	public static void closeBulkScope() {
-		ArrayDeque<Boolean> present = BULK_SCOPE_PRESENT.get();
-		boolean hasScope = !present.isEmpty() && present.pop();
-		ArrayDeque<ActorContext.Scope> scopes = BULK_SCOPES.get();
-		if (hasScope && !scopes.isEmpty()) scopes.pop().close();
+	public static void completeBulkScope(ActorContext.Scope scope, Integer resultCount) {
+		if (scope == null) return;
+		if (resultCount != null) {
+			ActorContext.Actor actor = ActorContext.current();
+			if (actor != null) actor.setBulkResultCount(resultCount);
+		}
+		scope.close();
+	}
+
+	public static void abortBulkScope(ActorContext.Scope scope) {
+		if (scope != null) scope.abort();
 	}
 
 	public static ActorContext.Scope beginWorldEditSet(Object actor, Object editSession, Object region, Object pattern) {
@@ -85,7 +86,13 @@ public final class BlockChangeRecorder1201 {
 		if (BulkPlacementIntrospection.isWorldEditAirPattern(pattern)) {
 			return beginBulkDeleteBounds(actorName, "WORLDEDIT_SET", bounds);
 		}
-		return beginBulkRecordOrDiscardLinear(actorName, "WORLDEDIT_SET", bounds);
+		return beginBulkRecordOrDiscardLinear(
+			actorName,
+			"WORLDEDIT_SET",
+			bounds,
+			BulkPlacementIntrospection.isWorldEditConstantBlockPattern(pattern)
+				&& BulkPlacementIntrospection.isWorldEditCuboidRegion(region)
+		);
 	}
 
 	public static ActorContext.Scope beginWorldEditReplace(Object actor, Object editSession, Object region, Object from, Object to) {
@@ -247,10 +254,39 @@ public final class BlockChangeRecorder1201 {
 	}
 
 	private static ActorContext.Scope beginBulkRecordOrDiscardLinear(String actorName, String source, BulkPlacementBounds bounds) {
+		return beginBulkRecordOrDiscardLinear(actorName, source, bounds, false);
+	}
+
+	private static ActorContext.Scope beginBulkRecordOrDiscardLinear(
+		String actorName,
+		String source,
+		BulkPlacementBounds bounds,
+		boolean completeBoundsCandidate
+	) {
 		if (bounds != null && discardLinearBulkPlacements && bounds.isLinearInfrastructure()) {
-			return beginBulkDeleteBounds(actorName, source, bounds, "mixed");
+			return ActorContext.pushBulkDeleteBounds(actorName, source, bounds, "mixed", actor -> {
+				BuildingIndexStore store = storeSupplier.get();
+				if (store != null) {
+					int auditCount = actor.bulkResultCount() >= 0
+						? actor.bulkResultCount()
+						: actor.bulkBounds().volumeBlockCount();
+					store.deleteIndexedBlocksInBounds(
+						actor.bulkBounds(),
+						actor.name,
+						actor.source,
+						actor.bulkChangeType(),
+						auditCount
+					);
+				}
+			});
 		}
-		return ActorContext.pushBulkRecord(actorName, source, BlockChangeRecorder1201::flushBulkChanges);
+		return ActorContext.pushBulkRecord(
+			actorName,
+			source,
+			bounds,
+			completeBoundsCandidate,
+			BlockChangeRecorder1201::flushBulkChanges
+		);
 	}
 
 	private static ActorContext.Scope beginBulkDeleteBounds(String actorName, String source, BulkPlacementBounds bounds) {
@@ -262,7 +298,13 @@ public final class BlockChangeRecorder1201 {
 		return ActorContext.pushBulkDeleteBounds(actorName, source, bounds, changeType, actor -> {
 			BuildingIndexStore store = storeSupplier.get();
 			if (store != null) {
-				store.deleteIndexedBlocksInBounds(actor.bulkBounds(), actor.name, actor.source, actor.bulkChangeType());
+				store.deleteIndexedBlocksInBounds(
+					actor.bulkBounds(),
+					actor.name,
+					actor.source,
+					actor.bulkChangeType(),
+					actor.bulkResultCount()
+				);
 			}
 		});
 	}
@@ -270,7 +312,22 @@ public final class BlockChangeRecorder1201 {
 	private static void flushBulkChanges(ActorContext.Actor actor) {
 		BuildingIndexStore store = storeSupplier.get();
 		if (store != null) {
-			store.recordBulkStateChanges(actor.bulkChanges(), actor.name, actor.source);
+			if (actor.isCompleteBoundsPlacement()
+				&& store.tryRecordCompleteBoundsPlacement(
+					actor.bulkBounds(),
+					actor.name,
+					actor.source,
+					actor.bulkResultCount()
+				)) {
+				return;
+			}
+			store.recordBulkStateChanges(
+				actor.bulkChanges(),
+				actor.name,
+				actor.source,
+				actor.bulkBounds(),
+				actor.bulkResultCount()
+			);
 		}
 	}
 

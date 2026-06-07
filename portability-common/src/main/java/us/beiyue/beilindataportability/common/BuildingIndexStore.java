@@ -20,12 +20,18 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 public final class BuildingIndexStore {
 	private static final int SCHEMA_VERSION = 8;
 	private static final int REGION_MERGE_GAP_BLOCKS = 2;
-	private static final int MAX_AUTO_REGION_VOLUME = 2_000_000;
 	private static final int MIN_EXPORT_COMPONENT_BLOCKS = 8;
+	private static final int WRITE_BATCH_SIZE = 1_000;
+	private static final long WRITE_BATCH_WAIT_MILLIS = 5L;
+	private static final long WRITER_STOP_TIMEOUT_SECONDS = 30L;
 	private static final int[][] NEIGHBORS = {
 		{1, 0, 0}, {-1, 0, 0},
 		{0, 1, 0}, {0, -1, 0},
@@ -35,6 +41,11 @@ public final class BuildingIndexStore {
 	private final Path dbPath;
 	private final CommonLogger log;
 	private final Connection connection;
+	private final BlockingQueue<WriteCommand> writeQueue = new LinkedBlockingQueue<>();
+	private final Object writerStateLock = new Object();
+	private final Thread writerThread;
+	private boolean acceptingWrites = true;
+	private boolean writerStarted = false;
 	private volatile boolean closed = false;
 	private volatile boolean structureAuditEnabled = true;
 
@@ -42,6 +53,8 @@ public final class BuildingIndexStore {
 		this.dbPath = dbPath;
 		this.log = log;
 		this.connection = connection;
+		this.writerThread = new Thread(this::runWriter, "beilin-portability-sqlite-writer");
+		this.writerThread.setDaemon(true);
 	}
 
 	public static BuildingIndexStore open(Path dbPath, CommonLogger log) throws IOException {
@@ -52,6 +65,7 @@ public final class BuildingIndexStore {
 			Connection connection = DriverManager.getConnection("jdbc:sqlite:" + dbPath.toAbsolutePath());
 			BuildingIndexStore store = new BuildingIndexStore(dbPath, log, connection);
 			store.initializeSchema();
+			store.startWriter();
 			log.info("Beilin Data Portability opened cuboid region index {} with {} region(s)", dbPath, store.size());
 			return store;
 		} catch (ReflectiveOperationException | SQLException e) {
@@ -59,48 +73,189 @@ public final class BuildingIndexStore {
 		}
 	}
 
-	public synchronized int size() {
-		return countRegions();
+	public int size() {
+		flushPendingWrites();
+		synchronized (this) {
+			return countRegions();
+		}
 	}
 
-	public synchronized void close() {
-		closed = true;
+	public void close() {
+		synchronized (writerStateLock) {
+			if (!acceptingWrites) return;
+			acceptingWrites = false;
+			putWriterCommand(StopCommand.INSTANCE);
+		}
+		if (Thread.currentThread() != writerThread) {
+			try {
+				writerThread.join(TimeUnit.SECONDS.toMillis(WRITER_STOP_TIMEOUT_SECONDS));
+				if (writerThread.isAlive()) {
+					writerThread.interrupt();
+					log.warn("Timed out while draining Beilin portability SQLite writes during close");
+				}
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				writerThread.interrupt();
+			}
+		}
+		synchronized (this) {
+			closed = true;
+			try {
+				connection.close();
+			} catch (SQLException ignored) {
+			}
+		}
+	}
+
+	public void flushPendingWrites() {
+		if (Thread.currentThread() == writerThread) return;
+		BarrierCommand barrier = new BarrierCommand();
+		synchronized (writerStateLock) {
+			if (!acceptingWrites || !writerStarted) return;
+			putWriterCommand(barrier);
+		}
 		try {
-			connection.close();
-		} catch (SQLException ignored) {
+			barrier.await();
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
 		}
 	}
 
-	/** @deprecated No-op. Retained for API compatibility with Mixin and platform callers. */
-	@Deprecated
-	public synchronized void flushPendingWrites() {
-	}
-
-	public synchronized void checkpoint() throws SQLException {
-		try (Statement stmt = connection.createStatement()) {
-			stmt.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+	public void checkpoint() throws SQLException {
+		flushPendingWrites();
+		synchronized (this) {
+			try (Statement stmt = connection.createStatement()) {
+				stmt.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+			}
 		}
 	}
 
-	public synchronized void compact() throws SQLException {
-		try (Statement stmt = connection.createStatement()) {
-			stmt.execute("VACUUM");
+	public void compact() throws SQLException {
+		flushPendingWrites();
+		synchronized (this) {
+			try (Statement stmt = connection.createStatement()) {
+				stmt.execute("VACUUM");
+			}
 		}
 	}
 
-	public synchronized String diagnosticSummary() {
-		return "db=" + dbPath
-			+ ", indexed_regions=" + countRegions()
-			+ ", structure_audit=" + (structureAuditEnabled ? "enabled" : "disabled")
-			+ ", pending_structure_audit=" + countPendingStructureAuditEvents()
-			+ ", schema=v" + SCHEMA_VERSION;
+	public String diagnosticSummary() {
+		flushPendingWrites();
+		synchronized (this) {
+			return "db=" + dbPath
+				+ ", indexed_regions=" + countRegions()
+				+ ", structure_audit=" + (structureAuditEnabled ? "enabled" : "disabled")
+				+ ", pending_structure_audit=" + countPendingStructureAuditEvents()
+				+ ", schema=v" + SCHEMA_VERSION;
+		}
 	}
 
 	public synchronized void setStructureAuditEnabled(boolean enabled) {
 		structureAuditEnabled = enabled;
 	}
 
-	public synchronized void recordPlaced(
+	private void startWriter() {
+		synchronized (writerStateLock) {
+			if (writerStarted) return;
+			writerStarted = true;
+			writerThread.start();
+		}
+	}
+
+	private void enqueueStateChange(PendingChange change) {
+		synchronized (writerStateLock) {
+			if (!acceptingWrites || closed) return;
+			writeQueue.offer(change);
+		}
+	}
+
+	private void putWriterCommand(WriteCommand command) {
+		boolean interrupted = false;
+		while (true) {
+			try {
+				writeQueue.put(command);
+				break;
+			} catch (InterruptedException e) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) Thread.currentThread().interrupt();
+	}
+
+	private void runWriter() {
+		List<PendingChange> batch = new ArrayList<>(WRITE_BATCH_SIZE);
+		WriteCommand deferred = null;
+		try {
+			while (true) {
+				WriteCommand command = deferred != null ? deferred : writeQueue.take();
+				deferred = null;
+				if (command instanceof PendingChange first) {
+					batch.clear();
+					batch.add(first);
+					long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WRITE_BATCH_WAIT_MILLIS);
+					while (batch.size() < WRITE_BATCH_SIZE) {
+						long remaining = deadline - System.nanoTime();
+						if (remaining <= 0L) break;
+						WriteCommand next = writeQueue.poll(remaining, TimeUnit.NANOSECONDS);
+						if (next == null) break;
+						if (next instanceof PendingChange change) {
+							batch.add(change);
+						} else {
+							deferred = next;
+							break;
+						}
+					}
+					applyQueuedStateChanges(batch);
+				} else if (command instanceof BarrierCommand barrier) {
+					barrier.complete();
+				} else if (command == StopCommand.INSTANCE) {
+					return;
+				}
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		} finally {
+			WriteCommand remaining;
+			while ((remaining = writeQueue.poll()) != null) {
+				if (remaining instanceof BarrierCommand barrier) barrier.complete();
+			}
+		}
+	}
+
+	private void applyQueuedStateChanges(List<PendingChange> changes) {
+		if (changes == null || changes.isEmpty()) return;
+		synchronized (this) {
+			if (closed) return;
+			boolean originalAutoCommit = true;
+			try {
+				originalAutoCommit = connection.getAutoCommit();
+				connection.setAutoCommit(false);
+				String now = SqliteUtcDatetimes.now();
+				Set<Long> affectedRegionIds = new HashSet<>();
+				BulkMutationBuffer mutationBuffer = new BulkMutationBuffer();
+				for (PendingChange change : changes) {
+					long affectedRegionId = applyChange(change, now, mutationBuffer);
+					if (affectedRegionId >= 0) affectedRegionIds.add(affectedRegionId);
+				}
+				flushBulkMutations(mutationBuffer, now);
+				finishRegionMaintenance(affectedRegionIds);
+				connection.commit();
+			} catch (SQLException e) {
+				try {
+					connection.rollback();
+				} catch (SQLException ignored) {
+				}
+				log.warn("Failed to apply {} queued portability block change(s): {}", changes.size(), e.toString());
+			} finally {
+				try {
+					connection.setAutoCommit(originalAutoCommit);
+				} catch (SQLException ignored) {
+				}
+			}
+		}
+	}
+
+	public void recordPlaced(
 		String dimension,
 		int x,
 		int y,
@@ -111,7 +266,7 @@ public final class BuildingIndexStore {
 		recordStateChangeWithSource(dimension, x, y, z, "minecraft:air", blockState, actorName, "PLAYER_EVENT");
 	}
 
-	public synchronized void recordRemoved(
+	public void recordRemoved(
 		String dimension,
 		int x,
 		int y,
@@ -121,7 +276,7 @@ public final class BuildingIndexStore {
 		recordStateChangeWithSource(dimension, x, y, z, null, "minecraft:air", actorName, "PLAYER_EVENT");
 	}
 
-	public synchronized void recordStateChangeWithSource(
+	public void recordStateChangeWithSource(
 		String dimension,
 		int x,
 		int y,
@@ -144,7 +299,7 @@ public final class BuildingIndexStore {
 		);
 	}
 
-	public synchronized void recordStateChangeWithSource(
+	public void recordStateChangeWithSource(
 		String dimension,
 		int x,
 		int y,
@@ -155,7 +310,6 @@ public final class BuildingIndexStore {
 		String actorName,
 		String source
 	) {
-		if (closed) return;
 		if (newBlockState == null || newBlockState.isBlank()) return;
 		String actor = displayActorName(actorName);
 		if (!isPlayerActor(actor)) return;
@@ -171,39 +325,47 @@ public final class BuildingIndexStore {
 			false
 		);
 		if (!shouldApplyChange(change)) return;
-		boolean originalAutoCommit = true;
-		try {
-			originalAutoCommit = connection.getAutoCommit();
-			connection.setAutoCommit(false);
-			applyChange(change);
-			connection.commit();
-		} catch (SQLException e) {
-			try {
-				connection.rollback();
-			} catch (SQLException ignored) {
-			}
-			log.warn("Failed to apply portability block change at {},{},{}: {}", x, y, z, e.toString());
-		} finally {
-			try {
-				connection.setAutoCommit(originalAutoCommit);
-			} catch (SQLException ignored) {
-			}
+		enqueueStateChange(change);
+	}
+
+	public void recordBulkStateChanges(List<BulkBlockChange> changes, String actorName, String source) {
+		recordBulkStateChanges(changes, actorName, source, null, -1);
+	}
+
+	public void recordBulkStateChanges(
+		List<BulkBlockChange> changes,
+		String actorName,
+		String source,
+		BulkPlacementBounds auditBounds,
+		int resultChangedBlockCount
+	) {
+		flushPendingWrites();
+		synchronized (this) {
+			recordBulkStateChangesNow(changes, actorName, source, auditBounds, resultChangedBlockCount);
 		}
 	}
 
-	public synchronized void recordBulkStateChanges(List<BulkBlockChange> changes, String actorName, String source) {
-		if (closed || changes == null || changes.isEmpty()) return;
+	private void recordBulkStateChangesNow(
+		List<BulkBlockChange> changes,
+		String actorName,
+		String source,
+		BulkPlacementBounds auditBounds,
+		int resultChangedBlockCount
+	) {
+		if (closed) return;
+		List<BulkBlockChange> sourceChanges = changes != null ? changes : List.of();
+		if (sourceChanges.isEmpty() && auditBounds == null) return;
 		String actor = displayActorName(actorName);
 		if (!isPlayerActor(actor)) return;
 		List<PendingChange> pending = new ArrayList<>();
-		boolean auditEnabled = structureAuditEnabled;
-		List<BulkBlockChange> auditChanges = auditEnabled ? new ArrayList<>() : null;
-		Set<String> seenCoordinates = new HashSet<>();
-		for (BulkBlockChange change : changes) {
+		StructureAuditEvent.Accumulator capturedAudit = structureAuditEnabled && auditBounds == null
+			? StructureAuditEvent.accumulator(actor, source)
+			: null;
+		Set<BlockCoordinate> seenCoordinates = new HashSet<>();
+		for (BulkBlockChange change : sourceChanges) {
 			if (change == null || change.newBlockState == null || change.newBlockState.isBlank()) continue;
 			String dimension = dimensionName(change.dimension);
-			String coordinateKey = dimension + '\0' + change.x + '\0' + change.y + '\0' + change.z;
-			if (!seenCoordinates.add(coordinateKey)) continue;
+			if (!seenCoordinates.add(new BlockCoordinate(dimension, change.x, change.y, change.z))) continue;
 			PendingChange pendingChange = new PendingChange(
 				dimension,
 				change.x,
@@ -217,23 +379,42 @@ public final class BuildingIndexStore {
 			);
 			if (shouldApplyChange(pendingChange)) {
 				pending.add(pendingChange);
-				if (auditChanges != null) {
-					auditChanges.add(change);
+				if (capturedAudit != null) {
+					capturedAudit.include(dimension, change.x, change.y, change.z, change.newBlockState);
 				}
 			}
 		}
-		if (pending.isEmpty()) return;
 		boolean originalAutoCommit = true;
 		String now = SqliteUtcDatetimes.now();
-		List<StructureAuditEvent> auditEvents = auditEnabled
-			? StructureAuditEvent.fromBulkChanges(auditChanges, actor, source, now)
-			: List.of();
+		List<StructureAuditEvent> auditEvents = List.of();
+		if (structureAuditEnabled && auditBounds != null) {
+			int changedBlockCount = resultChangedBlockCount >= 0
+				? resultChangedBlockCount
+				: (pending.isEmpty() ? -1 : pending.size());
+			StructureAuditEvent event = StructureAuditEvent.fromBounds(
+				auditBounds,
+				actor,
+				source,
+				auditChangeType(sourceChanges),
+				changedBlockCount,
+				now
+			);
+			auditEvents = event != null ? List.of(event) : List.of();
+		} else if (capturedAudit != null) {
+			auditEvents = capturedAudit.toEvents(now, resultChangedBlockCount);
+		}
+		if (pending.isEmpty() && auditEvents.isEmpty()) return;
 		try {
 			originalAutoCommit = connection.getAutoCommit();
 			connection.setAutoCommit(false);
+			Set<Long> affectedRegionIds = new HashSet<>();
+			BulkMutationBuffer mutationBuffer = new BulkMutationBuffer();
 			for (PendingChange change : pending) {
-				applyChange(change);
+				long affectedRegionId = applyChange(change, now, mutationBuffer);
+				if (affectedRegionId >= 0) affectedRegionIds.add(affectedRegionId);
 			}
+			flushBulkMutations(mutationBuffer, now);
+			finishRegionMaintenance(affectedRegionIds);
 			for (StructureAuditEvent event : auditEvents) {
 				insertStructureAuditEvent(event);
 			}
@@ -252,11 +433,140 @@ public final class BuildingIndexStore {
 		}
 	}
 
-	public synchronized void deleteIndexedBlocksInBounds(BulkPlacementBounds bounds, String actorName, String source) {
+	private static String auditChangeType(List<BulkBlockChange> changes) {
+		boolean hasPlace = false;
+		boolean hasDelete = false;
+		if (changes != null) {
+			for (BulkBlockChange change : changes) {
+				if (change == null || change.newBlockState == null || change.newBlockState.isBlank()) continue;
+				if (isAirState(change.newBlockState)) hasDelete = true;
+				else hasPlace = true;
+				if (hasPlace && hasDelete) return "mixed";
+			}
+		}
+		if (hasDelete) return "delete";
+		if (hasPlace) return "place";
+		return "mixed";
+	}
+
+	public boolean tryRecordCompleteBoundsPlacement(
+		BulkPlacementBounds bounds,
+		String actorName,
+		String source,
+		int changedBlockCount
+	) {
+		flushPendingWrites();
+		synchronized (this) {
+			return tryRecordCompleteBoundsPlacementNow(bounds, actorName, source, changedBlockCount);
+		}
+	}
+
+	private boolean tryRecordCompleteBoundsPlacementNow(
+		BulkPlacementBounds bounds,
+		String actorName,
+		String source,
+		int changedBlockCount
+	) {
+		if (closed || bounds == null) return false;
+		String actor = displayActorName(actorName);
+		if (!isPlayerActor(actor)) return false;
+		int volume = bounds.volumeBlockCount();
+		if (volume <= 0) return false;
+		Bounds placedBounds = new Bounds(bounds.minX, bounds.minY, bounds.minZ, bounds.maxX, bounds.maxY, bounds.maxZ);
+		if (isLinearInfrastructure(placedBounds, volume)) return false;
+
+		boolean originalAutoCommit = true;
+		String dimension = dimensionName(bounds.dimension);
+		String now = SqliteUtcDatetimes.now();
+		try {
+			originalAutoCommit = connection.getAutoCommit();
+			List<Region> overlapping = regionsOverlappingBounds(dimension, placedBounds, 0);
+			Bounds merged = placedBounds;
+			int estimatedNonAir = volume;
+			for (Region region : overlapping) {
+				merged = merged.merge(region);
+				estimatedNonAir = saturatingAdd(estimatedNonAir, Math.max(0, region.nonAirCount));
+			}
+			if (isLinearInfrastructure(merged, estimatedNonAir)) {
+				return false;
+			}
+
+			connection.setAutoCommit(false);
+			long targetRegionId;
+			if (overlapping.isEmpty()) {
+				targetRegionId = insertRegion(dimension, merged, now);
+			} else {
+				targetRegionId = overlapping.get(0).id;
+				updateRegionBounds(targetRegionId, merged, now);
+				for (int i = 1; i < overlapping.size(); i++) {
+					Region sourceRegion = overlapping.get(i);
+					if (sourceRegion.id != targetRegionId) {
+						mergeRegionInto(targetRegionId, sourceRegion.id, merged);
+					}
+				}
+			}
+
+			insertCompleteBoundsBlocks(targetRegionId, actor, dimension, placedBounds, now);
+			upsertAuthor(targetRegionId, actor, volume, volume, now);
+			mergeCompatibleRegions(targetRegionId);
+			refreshAuthorRatios(targetRegionId);
+			refreshRiskFlags(targetRegionId);
+			if (structureAuditEnabled) {
+				StructureAuditEvent event = StructureAuditEvent.fromBounds(
+					bounds,
+					actor,
+					source,
+					"place",
+					changedBlockCount,
+					now
+				);
+				if (event != null) insertStructureAuditEvent(event);
+			}
+			connection.commit();
+			return true;
+		} catch (SQLException e) {
+			try {
+				connection.rollback();
+			} catch (SQLException ignored) {
+			}
+			log.warn("Failed to apply complete bounds placement from {}: {}", source, e.toString());
+			return false;
+		} finally {
+			try {
+				connection.setAutoCommit(originalAutoCommit);
+			} catch (SQLException ignored) {
+			}
+		}
+	}
+
+	public void deleteIndexedBlocksInBounds(BulkPlacementBounds bounds, String actorName, String source) {
 		deleteIndexedBlocksInBounds(bounds, actorName, source, "delete");
 	}
 
-	public synchronized void deleteIndexedBlocksInBounds(BulkPlacementBounds bounds, String actorName, String source, String changeType) {
+	public void deleteIndexedBlocksInBounds(BulkPlacementBounds bounds, String actorName, String source, String changeType) {
+		deleteIndexedBlocksInBounds(bounds, actorName, source, changeType, -1);
+	}
+
+	public void deleteIndexedBlocksInBounds(
+		BulkPlacementBounds bounds,
+		String actorName,
+		String source,
+		String changeType,
+		int auditChangedBlockCount
+	) {
+		flushPendingWrites();
+		synchronized (this) {
+			deleteIndexedBlocksInBoundsNow(bounds, actorName, source, changeType, auditChangedBlockCount);
+		}
+	}
+
+	private void deleteIndexedBlocksInBoundsNow(
+		BulkPlacementBounds bounds,
+		String actorName,
+		String source,
+		String changeType,
+		int auditChangedBlockCount
+	) {
 		if (closed || bounds == null) return;
 		String actor = displayActorName(actorName);
 		if (!isPlayerActor(actor)) return;
@@ -267,10 +577,6 @@ public final class BuildingIndexStore {
 			originalAutoCommit = connection.getAutoCommit();
 			connection.setAutoCommit(false);
 			Map<Long, Integer> affected = indexedBlockCountsInBounds(bounds, dimension);
-			int changedBlocks = 0;
-			for (Integer value : affected.values()) {
-				changedBlocks += Math.max(0, value == null ? 0 : value);
-			}
 			if (!affected.isEmpty()) {
 				deletePlacedBlocksInBounds(bounds, dimension);
 				for (Map.Entry<Long, Integer> entry : affected.entrySet()) {
@@ -278,13 +584,22 @@ public final class BuildingIndexStore {
 					int deletedBlocks = Math.max(1, entry.getValue());
 					upsertAuthor(regionId, actor, 0, deletedBlocks, now);
 					touchRegion(regionId, now);
-					markDirty(regionId, now);
 					refreshAuthorRatios(regionId);
 					refreshRiskFlags(regionId);
 				}
 			}
 			if (structureAuditEnabled) {
-				StructureAuditEvent auditEvent = StructureAuditEvent.fromBounds(bounds, actor, source, changeType, changedBlocks, now);
+				int reportedChangedBlocks = auditChangedBlockCount >= 0
+					? auditChangedBlockCount
+					: -1;
+				StructureAuditEvent auditEvent = StructureAuditEvent.fromBounds(
+					bounds,
+					actor,
+					source,
+					changeType,
+					reportedChangedBlocks,
+					now
+				);
 				if (auditEvent != null) {
 					insertStructureAuditEvent(auditEvent);
 				}
@@ -308,7 +623,14 @@ public final class BuildingIndexStore {
 		return buildExportBundle(job, reader, maxExportVolumeBlocks).manifest;
 	}
 
-	public synchronized List<StructureAuditEvent> listPendingStructureAuditEvents(int limit) {
+	public List<StructureAuditEvent> listPendingStructureAuditEvents(int limit) {
+		flushPendingWrites();
+		synchronized (this) {
+			return listPendingStructureAuditEventsNow(limit);
+		}
+	}
+
+	private List<StructureAuditEvent> listPendingStructureAuditEventsNow(int limit) {
 		if (closed) return List.of();
 		int safeLimit = Math.max(1, Math.min(200, limit));
 		try (PreparedStatement ps = connection.prepareStatement("""
@@ -328,7 +650,14 @@ public final class BuildingIndexStore {
 		}
 	}
 
-	public synchronized void deleteStructureAuditOutboxEvents(List<String> eventIds) {
+	public void deleteStructureAuditOutboxEvents(List<String> eventIds) {
+		flushPendingWrites();
+		synchronized (this) {
+			deleteStructureAuditOutboxEventsNow(eventIds);
+		}
+	}
+
+	private void deleteStructureAuditOutboxEventsNow(List<String> eventIds) {
 		if (closed || eventIds == null || eventIds.isEmpty()) return;
 		try (PreparedStatement ps = connection.prepareStatement(
 			"DELETE FROM structure_audit_outbox WHERE event_id = ?"
@@ -345,6 +674,7 @@ public final class BuildingIndexStore {
 	}
 
 	public ExportBundle buildExportBundle(ExportJob job, WorldBlockReader reader, int maxExportVolumeBlocks) throws IOException {
+		flushPendingWrites();
 		String target = normalizeName(job.minecraftUsername);
 		List<RegionExportPlan> plans;
 		int indexedRegionCount;
@@ -440,21 +770,20 @@ public final class BuildingIndexStore {
 		return new ExportBundle(manifest, exports);
 	}
 
-	private void applyChange(PendingChange change) throws SQLException {
+	private long applyChange(PendingChange change, String now, BulkMutationBuffer mutationBuffer) throws SQLException {
 		String actorName = displayActorName(change.actorName);
 		boolean playerActor = isPlayerActor(actorName);
 		boolean newAir = isAirState(change.newBlockState);
 		boolean firstPlacement = isFirstPlacement(change, newAir);
 		boolean playerCanExpandRegion = playerActor && firstPlacement;
 		Region region = findCandidateRegion(change.dimension, change.x, change.y, change.z, playerCanExpandRegion);
-		String now = SqliteUtcDatetimes.now();
 
 		if (region == null && firstPlacement && playerActor) {
 			long id = insertRegion(change.dimension, change.x, change.y, change.z, now);
 			region = findRegion(id);
 		}
 
-		if (region == null) return;
+		if (region == null) return -1L;
 
 		Bounds next = playerCanExpandRegion ? region.include(change.x, change.y, change.z) : region;
 		if (!newAir && !next.equalsBounds(region)) {
@@ -465,19 +794,127 @@ public final class BuildingIndexStore {
 		}
 
 		if (playerActor) {
-			upsertAuthor(region.id, actorName, firstPlacement ? 1 : 0, 1, now);
-			if (firstPlacement) {
-				upsertPlacedBlock(region.id, actorName, change.dimension, change.x, change.y, change.z, now);
-			} else if (newAir) {
-				deletePlacedBlock(region.id, change.dimension, change.x, change.y, change.z);
+			if (mutationBuffer != null) {
+				mutationBuffer.addAuthor(region.id, actorName, firstPlacement ? 1 : 0, 1);
+				if (firstPlacement) {
+					mutationBuffer.addPlacement(region.id, actorName, change.dimension, change.x, change.y, change.z);
+				} else if (newAir) {
+					mutationBuffer.addDeletion(region.id, actorName, change.dimension, change.x, change.y, change.z);
+				}
+			} else {
+				upsertAuthor(region.id, actorName, firstPlacement ? 1 : 0, 1, now);
+				if (firstPlacement) {
+					upsertPlacedBlock(region.id, actorName, change.dimension, change.x, change.y, change.z, now);
+				} else if (newAir) {
+					deletePlacedBlock(region.id, change.dimension, change.x, change.y, change.z);
+				}
 			}
 		}
 
-		markDirty(region.id, now);
-		if (region != null) {
-			refreshAuthorRatios(region.id);
-			refreshRiskFlags(region.id);
-			mergeCompatibleRegions(region.id);
+		return region.id;
+	}
+
+	private void finishRegionMaintenance(Set<Long> affectedRegionIds) throws SQLException {
+		if (affectedRegionIds == null || affectedRegionIds.isEmpty()) return;
+		Set<Long> survivingRegionIds = new HashSet<>();
+		for (Long regionId : affectedRegionIds) {
+			if (regionId == null || findRegion(regionId) == null) continue;
+			mergeCompatibleRegions(regionId);
+			if (findRegion(regionId) != null) survivingRegionIds.add(regionId);
+		}
+		for (Long regionId : survivingRegionIds) {
+			refreshAuthorRatios(regionId);
+			refreshRiskFlags(regionId);
+		}
+	}
+
+	private void flushBulkMutations(BulkMutationBuffer buffer, String now) throws SQLException {
+		if (buffer == null) return;
+		if (!buffer.authorDeltas.isEmpty()) {
+			try (PreparedStatement ps = connection.prepareStatement("""
+				INSERT INTO region_authors (
+					region_id, player_name_key, display_name,
+					first_place_count, last_modify_count, contribution_score,
+					ratio_bp, last_touched_at
+				) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+				ON CONFLICT(region_id, player_name_key) DO UPDATE SET
+					display_name = excluded.display_name,
+					first_place_count = first_place_count + excluded.first_place_count,
+					last_modify_count = last_modify_count + excluded.last_modify_count,
+					contribution_score = contribution_score + excluded.contribution_score,
+					last_touched_at = excluded.last_touched_at
+				""")) {
+				int batched = 0;
+				for (Map.Entry<AuthorMutationKey, AuthorDelta> entry : buffer.authorDeltas.entrySet()) {
+					AuthorMutationKey key = entry.getKey();
+					AuthorDelta delta = entry.getValue();
+					ps.setLong(1, key.regionId);
+					ps.setString(2, key.playerNameKey);
+					ps.setString(3, delta.displayName);
+					ps.setInt(4, Math.max(0, delta.firstPlaceCount));
+					ps.setInt(5, Math.max(0, delta.lastModifyCount));
+					ps.setInt(6, Math.max(0, delta.firstPlaceCount) + Math.max(0, delta.lastModifyCount));
+					ps.setString(7, now);
+					ps.addBatch();
+					if (++batched >= WRITE_BATCH_SIZE) {
+						ps.executeBatch();
+						ps.clearBatch();
+						batched = 0;
+					}
+				}
+				if (batched > 0) ps.executeBatch();
+			}
+		}
+		if (!buffer.mutations.isEmpty()) {
+			try (
+				PreparedStatement placement = connection.prepareStatement("""
+					INSERT INTO region_blocks (
+						region_id, player_name_key, dimension, x, y, z, first_placed_at, last_touched_at
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+					ON CONFLICT(region_id, player_name_key, dimension, x, y, z) DO UPDATE SET
+						last_touched_at = excluded.last_touched_at
+					""");
+				PreparedStatement deletion = connection.prepareStatement("""
+					DELETE FROM region_blocks
+					WHERE region_id = ? AND dimension = ? AND x = ? AND y = ? AND z = ?
+					""")
+			) {
+				Boolean placementRun = null;
+				int batched = 0;
+				for (BlockMutation mutation : buffer.mutations) {
+					if (placementRun == null || placementRun != mutation.placement || batched >= WRITE_BATCH_SIZE) {
+						if (placementRun != null && batched > 0) {
+							PreparedStatement current = placementRun ? placement : deletion;
+							current.executeBatch();
+							current.clearBatch();
+						}
+						placementRun = mutation.placement;
+						batched = 0;
+					}
+					if (mutation.placement) {
+						placement.setLong(1, mutation.regionId);
+						placement.setString(2, normalizeName(mutation.actorName));
+						placement.setString(3, dimensionName(mutation.dimension));
+						placement.setInt(4, mutation.x);
+						placement.setInt(5, mutation.y);
+						placement.setInt(6, mutation.z);
+						placement.setString(7, now);
+						placement.setString(8, now);
+						placement.addBatch();
+					} else {
+						deletion.setLong(1, mutation.regionId);
+						deletion.setString(2, dimensionName(mutation.dimension));
+						deletion.setInt(3, mutation.x);
+						deletion.setInt(4, mutation.y);
+						deletion.setInt(5, mutation.z);
+						deletion.addBatch();
+					}
+					batched += 1;
+				}
+				if (placementRun != null && batched > 0) {
+					(placementRun ? placement : deletion).executeBatch();
+				}
+			}
 		}
 	}
 
@@ -648,22 +1085,27 @@ public final class BuildingIndexStore {
 	}
 
 	private long insertRegion(String dimension, int x, int y, int z, String now) throws SQLException {
+		return insertRegion(dimension, new Bounds(x, y, z, x, y, z), now);
+	}
+
+	private long insertRegion(String dimension, Bounds bounds, String now) throws SQLException {
 		try (PreparedStatement ps = connection.prepareStatement("""
 			INSERT INTO building_regions (
 				dimension, min_x, min_y, min_z, max_x, max_y, max_z,
 				volume_blocks, status, last_touched_at, dirty, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, 1, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 1, ?, ?)
 			""")) {
 			ps.setString(1, dimension);
-			ps.setInt(2, x);
-			ps.setInt(3, y);
-			ps.setInt(4, z);
-			ps.setInt(5, x);
-			ps.setInt(6, y);
-			ps.setInt(7, z);
-			ps.setString(8, now);
+			ps.setInt(2, bounds.minX);
+			ps.setInt(3, bounds.minY);
+			ps.setInt(4, bounds.minZ);
+			ps.setInt(5, bounds.maxX);
+			ps.setInt(6, bounds.maxY);
+			ps.setInt(7, bounds.maxZ);
+			ps.setInt(8, safeVolume(bounds));
 			ps.setString(9, now);
 			ps.setString(10, now);
+			ps.setString(11, now);
 			ps.executeUpdate();
 		}
 		try (Statement stmt = connection.createStatement();
@@ -699,21 +1141,11 @@ public final class BuildingIndexStore {
 
 	private void touchRegion(long regionId, String now) throws SQLException {
 		try (PreparedStatement ps = connection.prepareStatement(
-			"UPDATE building_regions SET last_touched_at = ?, updated_at = ? WHERE id = ?"
+			"UPDATE building_regions SET last_touched_at = ?, updated_at = ?, dirty = 1 WHERE id = ?"
 		)) {
 			ps.setString(1, now);
 			ps.setString(2, now);
 			ps.setLong(3, regionId);
-			ps.executeUpdate();
-		}
-	}
-
-	private void markDirty(long regionId, String now) throws SQLException {
-		try (PreparedStatement ps = connection.prepareStatement(
-			"UPDATE building_regions SET dirty = 1, updated_at = ? WHERE id = ?"
-		)) {
-			ps.setString(1, now);
-			ps.setLong(2, regionId);
 			ps.executeUpdate();
 		}
 	}
@@ -763,6 +1195,44 @@ public final class BuildingIndexStore {
 			ps.setInt(6, z);
 			ps.setString(7, now);
 			ps.setString(8, now);
+			ps.executeUpdate();
+		}
+	}
+
+	private void insertCompleteBoundsBlocks(
+		long regionId,
+		String actorName,
+		String dimension,
+		Bounds bounds,
+		String now
+	) throws SQLException {
+		String key = normalizeName(actorName);
+		if (key.isBlank()) return;
+		try (PreparedStatement ps = connection.prepareStatement("""
+			WITH RECURSIVE
+			x(v) AS (VALUES (?) UNION ALL SELECT v + 1 FROM x WHERE v < ?),
+			y(v) AS (VALUES (?) UNION ALL SELECT v + 1 FROM y WHERE v < ?),
+			z(v) AS (VALUES (?) UNION ALL SELECT v + 1 FROM z WHERE v < ?)
+			INSERT INTO region_blocks (
+				region_id, player_name_key, dimension, x, y, z, first_placed_at, last_touched_at
+			)
+			SELECT ?, ?, ?, x.v, y.v, z.v, ?, ?
+			FROM x CROSS JOIN y CROSS JOIN z
+			WHERE 1
+			ON CONFLICT(region_id, player_name_key, dimension, x, y, z) DO UPDATE SET
+				last_touched_at = excluded.last_touched_at
+			""")) {
+			ps.setInt(1, bounds.minX);
+			ps.setInt(2, bounds.maxX);
+			ps.setInt(3, bounds.minY);
+			ps.setInt(4, bounds.maxY);
+			ps.setInt(5, bounds.minZ);
+			ps.setInt(6, bounds.maxZ);
+			ps.setLong(7, regionId);
+			ps.setString(8, key);
+			ps.setString(9, dimensionName(dimension));
+			ps.setString(10, now);
+			ps.setString(11, now);
 			ps.executeUpdate();
 		}
 	}
@@ -831,7 +1301,6 @@ public final class BuildingIndexStore {
 		for (Region region : candidates) {
 			if (!expanding) return region;
 			Bounds expanded = region.include(x, y, z);
-			if (safeVolume(expanded) > MAX_AUTO_REGION_VOLUME) continue;
 			if (isLinearInfrastructure(expanded, Math.max(1, region.nonAirCount))) continue;
 			return region;
 		}
@@ -861,6 +1330,30 @@ public final class BuildingIndexStore {
 		}
 	}
 
+	private List<Region> regionsOverlappingBounds(String dimension, Bounds bounds, int gap) throws SQLException {
+		try (PreparedStatement ps = connection.prepareStatement("""
+			SELECT * FROM building_regions
+			WHERE dimension = ? AND status = 'active'
+			  AND min_x <= ? AND max_x >= ?
+			  AND min_y <= ? AND max_y >= ?
+			  AND min_z <= ? AND max_z >= ?
+			ORDER BY id ASC
+			""")) {
+			ps.setString(1, dimension);
+			ps.setInt(2, bounds.maxX + gap);
+			ps.setInt(3, bounds.minX - gap);
+			ps.setInt(4, bounds.maxY + gap);
+			ps.setInt(5, bounds.minY - gap);
+			ps.setInt(6, bounds.maxZ + gap);
+			ps.setInt(7, bounds.minZ - gap);
+			try (ResultSet rs = ps.executeQuery()) {
+				List<Region> out = new ArrayList<>();
+				while (rs.next()) out.add(region(rs));
+				return out;
+			}
+		}
+	}
+
 	private void mergeCompatibleRegions(long regionId) throws SQLException {
 		Region base = findRegion(regionId);
 		if (base == null) return;
@@ -868,7 +1361,6 @@ public final class BuildingIndexStore {
 		for (Region other : others) {
 			if (other.id == base.id) continue;
 			Bounds merged = base.merge(other);
-			if (safeVolume(merged) > MAX_AUTO_REGION_VOLUME) continue;
 			if (isLinearInfrastructure(merged, base.nonAirCount + other.nonAirCount)) continue;
 			mergeRegionInto(base.id, other.id, merged);
 			base = findRegion(base.id);
@@ -959,8 +1451,6 @@ public final class BuildingIndexStore {
 			ps.setLong(1, sourceId);
 			ps.executeUpdate();
 		}
-		refreshAuthorRatios(targetId);
-		refreshRiskFlags(targetId);
 	}
 
 	private void refreshAuthorRatios(long regionId) throws SQLException {
@@ -1182,7 +1672,6 @@ public final class BuildingIndexStore {
 	}
 
 	private static boolean shouldMergeGroups(MutableGroup a, MutableGroup b, Bounds merged, int mergedNonAir) {
-		if (safeVolume(merged) > MAX_AUTO_REGION_VOLUME) return false;
 		if (isLinearInfrastructure(merged, mergedNonAir)) return false;
 		int gap = a.bounds.distanceTo(b.bounds);
 		if (gap <= 1) return true;
@@ -1260,6 +1749,11 @@ public final class BuildingIndexStore {
 		return v > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) Math.max(1L, v);
 	}
 
+	private static int saturatingAdd(int a, int b) {
+		long sum = (long) Math.max(0, a) + Math.max(0, b);
+		return sum > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) sum;
+	}
+
 	private static String dimensionName(String raw) {
 		return DimensionNames.normalize(raw);
 	}
@@ -1292,7 +1786,76 @@ public final class BuildingIndexStore {
 			|| s.endsWith("{minecraft:air}");
 	}
 
-	private static final class PendingChange {
+	private interface WriteCommand {
+	}
+
+	private static final class BarrierCommand implements WriteCommand {
+		private final CountDownLatch completed = new CountDownLatch(1);
+
+		void complete() {
+			completed.countDown();
+		}
+
+		void await() throws InterruptedException {
+			completed.await();
+		}
+	}
+
+	private enum StopCommand implements WriteCommand {
+		INSTANCE
+	}
+
+	private static final class BulkMutationBuffer {
+		final Map<AuthorMutationKey, AuthorDelta> authorDeltas = new HashMap<>();
+		final List<BlockMutation> mutations = new ArrayList<>();
+
+		void addAuthor(long regionId, String actorName, int firstPlaceCount, int lastModifyCount) {
+			AuthorMutationKey key = new AuthorMutationKey(regionId, normalizeName(actorName));
+			AuthorDelta delta = authorDeltas.computeIfAbsent(key, ignored -> new AuthorDelta());
+			delta.displayName = actorName.trim();
+			delta.firstPlaceCount = saturatingAdd(delta.firstPlaceCount, firstPlaceCount);
+			delta.lastModifyCount = saturatingAdd(delta.lastModifyCount, lastModifyCount);
+		}
+
+		void addPlacement(long regionId, String actorName, String dimension, int x, int y, int z) {
+			mutations.add(new BlockMutation(regionId, actorName, dimension, x, y, z, true));
+		}
+
+		void addDeletion(long regionId, String actorName, String dimension, int x, int y, int z) {
+			mutations.add(new BlockMutation(regionId, actorName, dimension, x, y, z, false));
+		}
+	}
+
+	private record AuthorMutationKey(long regionId, String playerNameKey) {
+	}
+
+	private static final class AuthorDelta {
+		String displayName;
+		int firstPlaceCount;
+		int lastModifyCount;
+	}
+
+	private static final class BlockMutation {
+		final long regionId;
+		final String actorName;
+		final String dimension;
+		final int x;
+		final int y;
+		final int z;
+		final boolean placement;
+
+		BlockMutation(long regionId, String actorName, String dimension, int x, int y, int z, boolean placement) {
+			this.regionId = regionId;
+			this.actorName = actorName;
+			this.dimension = dimension;
+			this.x = x;
+			this.y = y;
+			this.z = z;
+			this.placement = placement;
+		}
+	}
+
+	private static final class PendingChange implements WriteCommand {
 		final String dimension;
 		final int x;
 		final int y;

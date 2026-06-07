@@ -21,19 +21,44 @@ public final class ActorContext {
 
 	public static Scope push(String actorName, String source) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null, null));
+		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null, false, null));
 		return new Scope(previous);
 	}
 
 	public static Scope pushNear(String actorName, String source, int x, int y, int z) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), x, y, z, DEFAULT_BLOCK_ACTION_RADIUS, RecordingMode.NORMAL, null, null, null));
+		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), x, y, z, DEFAULT_BLOCK_ACTION_RADIUS, RecordingMode.NORMAL, null, null, false, null));
 		return new Scope(previous);
 	}
 
 	public static Scope pushBulkRecord(String actorName, String source, Consumer<Actor> flush) {
+		return pushBulkRecord(actorName, source, null, false, flush);
+	}
+
+	public static Scope pushBulkRecord(
+		String actorName,
+		String source,
+		BulkPlacementBounds bounds,
+		boolean completeBoundsCandidate,
+		Consumer<Actor> flush
+	) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_RECORD, null, null, flush));
+		RecordingMode recordingMode = completeBoundsCandidate && bounds != null
+			? RecordingMode.BULK_COMPLETE_BOUNDS
+			: RecordingMode.BULK_RECORD;
+		CURRENT.set(new Actor(
+			displayActorName(actorName),
+			sourceName(source),
+			null,
+			null,
+			null,
+			0,
+			recordingMode,
+			bounds,
+			null,
+			completeBoundsCandidate,
+			flush
+		));
 		return new Scope(previous);
 	}
 
@@ -43,22 +68,22 @@ public final class ActorContext {
 
 	public static Scope pushBulkDeleteBounds(String actorName, String source, BulkPlacementBounds bounds, String changeType, Consumer<Actor> flush) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_DELETE_BOUNDS, bounds, changeTypeName(changeType), flush));
+		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_DELETE_BOUNDS, bounds, changeTypeName(changeType), false, flush));
 		return new Scope(previous);
 	}
 
 	public static Scope pushBulkIgnore(String actorName, String source) {
 		Actor previous = CURRENT.get();
-		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_IGNORE, null, null, null));
+		CURRENT.set(new Actor(displayActorName(actorName), sourceName(source), null, null, null, 0, RecordingMode.BULK_IGNORE, null, null, false, null));
 		return new Scope(previous);
 	}
 
 	public static Actor system(String source) {
-		return new Actor(SYSTEM_ACTOR, sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null, null);
+		return new Actor(SYSTEM_ACTOR, sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null, false, null);
 	}
 
 	public static Actor unknown(String source) {
-		return new Actor(UNKNOWN_ACTOR, sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null, null);
+		return new Actor(UNKNOWN_ACTOR, sourceName(source), null, null, null, 0, RecordingMode.NORMAL, null, null, false, null);
 	}
 
 	public static String normalizeName(String name) {
@@ -92,11 +117,19 @@ public final class ActorContext {
 
 		@Override
 		public void close() {
+			finish(true);
+		}
+
+		public void abort() {
+			finish(false);
+		}
+
+		private void finish(boolean flush) {
 			if (closed) return;
 			closed = true;
 			Actor current = CURRENT.get();
 			try {
-				if (current != null && current.bulkFlush != null) {
+				if (flush && current != null && current.bulkFlush != null) {
 					current.bulkFlush.accept(current);
 				}
 			} finally {
@@ -112,6 +145,7 @@ public final class ActorContext {
 	public enum RecordingMode {
 		NORMAL,
 		BULK_RECORD,
+		BULK_COMPLETE_BOUNDS,
 		BULK_DELETE_BOUNDS,
 		BULK_IGNORE
 	}
@@ -127,8 +161,10 @@ public final class ActorContext {
 		private final int radius;
 		private final BulkPlacementBounds bulkBounds;
 		private final String bulkChangeType;
+		private final boolean completeBoundsCandidate;
 		private final Consumer<Actor> bulkFlush;
 		private final List<BulkBlockChange> bulkChanges = new ArrayList<>();
+		private int bulkResultCount = -1;
 
 		private Actor(
 			String name,
@@ -140,6 +176,7 @@ public final class ActorContext {
 			RecordingMode recordingMode,
 			BulkPlacementBounds bulkBounds,
 			String bulkChangeType,
+			boolean completeBoundsCandidate,
 			Consumer<Actor> bulkFlush
 		) {
 			this.name = name;
@@ -152,6 +189,7 @@ public final class ActorContext {
 			this.recordingMode = recordingMode != null ? recordingMode : RecordingMode.NORMAL;
 			this.bulkBounds = bulkBounds;
 			this.bulkChangeType = changeTypeName(bulkChangeType);
+			this.completeBoundsCandidate = completeBoundsCandidate;
 			this.bulkFlush = bulkFlush;
 		}
 
@@ -169,7 +207,9 @@ public final class ActorContext {
 		}
 
 		public boolean shouldIgnoreBlockRecords() {
-			return recordingMode == RecordingMode.BULK_IGNORE || recordingMode == RecordingMode.BULK_DELETE_BOUNDS;
+			return recordingMode == RecordingMode.BULK_IGNORE
+				|| recordingMode == RecordingMode.BULK_COMPLETE_BOUNDS
+				|| recordingMode == RecordingMode.BULK_DELETE_BOUNDS;
 		}
 
 		public boolean shouldForcePlacementRecords() {
@@ -191,6 +231,24 @@ public final class ActorContext {
 
 		public List<BulkBlockChange> bulkChanges() {
 			return List.copyOf(bulkChanges);
+		}
+
+		public void setBulkResultCount(int count) {
+			if (recordingMode == RecordingMode.BULK_RECORD
+				|| recordingMode == RecordingMode.BULK_COMPLETE_BOUNDS
+				|| recordingMode == RecordingMode.BULK_DELETE_BOUNDS) {
+				bulkResultCount = Math.max(0, count);
+			}
+		}
+
+		public int bulkResultCount() {
+			return bulkResultCount;
+		}
+
+		public boolean isCompleteBoundsPlacement() {
+			return recordingMode == RecordingMode.BULK_COMPLETE_BOUNDS
+				&& completeBoundsCandidate
+				&& bulkBounds != null;
 		}
 	}
 }
