@@ -32,12 +32,15 @@ public final class BeilinEntryControl1192 implements ModInitializer {
 		try {
 			config = ModConfig1192.loadOrCreate();
 		} catch (Exception e) {
-			LOGGER.error("Failed to load config", e);
-			return;
+			throw new IllegalStateException(
+				"Failed to load Beilin Entry Control config from " + ModConfig1192.configPath(),
+				e
+			);
 		}
 		if (!config.isApiKeyConfigured()) {
-			LOGGER.error("Beilin Entry Control: You need to set the apiKey to run the server. Please edit {} to set it.", ModConfig1192.configPath());
-			System.exit(1);
+			throw new IllegalStateException(
+				"Beilin Entry Control requires an apiKey. Please configure " + ModConfig1192.configPath()
+			);
 		}
 
 		outboundRouteState = new OutboundRouteState();
@@ -92,4 +95,3 @@ public final class BeilinEntryControl1192 implements ModInitializer {
 		}
 	}
 }
-
