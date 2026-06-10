@@ -1,9 +1,13 @@
 package us.beiyue.beilindataportability.common;
 
 import us.beiyue.beilinentrycontrol.common.log.CommonLogger;
+import us.beiyue.beilinentrycontrol.common.ws.BeilinWsEvents;
+import us.beiyue.beilinentrycontrol.common.ws.ExportJobsListener;
+import us.beiyue.beilinentrycontrol.common.ws.WsExportJob;
 
 import java.nio.file.Path;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Queue;
@@ -28,7 +32,7 @@ public final class PortabilityRuntime {
 	private final Path artifactDir;
 	private final int maxExportVolumeBlocks;
 	private final ScheduledExecutorService scheduler;
-	private final PortabilityBridge.Listener exportJobsListener = this::onExportJobs;
+	private final ExportJobsListener exportJobsListener = this::onWsExportJobs;
 	private final Queue<ExportJob> pendingJobs = new ArrayDeque<>();
 	private final Set<Long> acceptedJobIds = new HashSet<>();
 	private final AtomicBoolean processing = new AtomicBoolean(false);
@@ -62,13 +66,14 @@ public final class PortabilityRuntime {
 	public void start() {
 		stopped.set(false);
 		if (!started.compareAndSet(false, true)) return;
-		PortabilityBridge.addListener(exportJobsListener);
+		// Control may receive jobs before SERVER_STARTED; its event cache replays them here.
+		BeilinWsEvents.addExportJobsListener(exportJobsListener);
 		log.info("Beilin Data Portability export push listener started");
 	}
 
 	public void stop() {
 		if (stopped.getAndSet(true)) return;
-		PortabilityBridge.removeListener(exportJobsListener);
+		BeilinWsEvents.removeExportJobsListener(exportJobsListener);
 		pendingJobs.clear();
 		acceptedJobIds.clear();
 		Long processingJobId = currentProcessingJobId.getAndSet(null);
@@ -84,6 +89,21 @@ public final class PortabilityRuntime {
 			failJobDuringStop(failJobId);
 		}
 		apiClient.shutdownNow();
+	}
+
+	private void onWsExportJobs(List<WsExportJob> jobs) {
+		if (jobs == null || jobs.isEmpty()) return;
+		List<ExportJob> converted = new ArrayList<>(jobs.size());
+		for (WsExportJob job : jobs) {
+			if (job == null) continue;
+			converted.add(new ExportJob(
+				job.requestId,
+				job.minecraftUsername,
+				job.requestedAt,
+				job.reviewedAt
+			));
+		}
+		onExportJobs(converted);
 	}
 
 	private void onExportJobs(List<ExportJob> jobs) {

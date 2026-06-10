@@ -41,24 +41,24 @@ tasks.register("litematicRoundTripTest", JavaExec) {
 	mainClass = "us.beiyue.beilindataportability.common.LitematicWriterRoundTripTest"
 }
 
-tasks.register("portabilityBridgeDispatchTest", JavaExec) {
-	dependsOn tasks.named("testClasses")
-	classpath = sourceSets.test.runtimeClasspath
-	mainClass = "us.beiyue.beilindataportability.common.PortabilityBridgeDispatchTest"
-}
-
 tasks.register("runtimeStopTest", JavaExec) {
 	dependsOn tasks.named("testClasses")
 	classpath = sourceSets.test.runtimeClasspath
 	mainClass = "us.beiyue.beilindataportability.common.PortabilityRuntimeStopTest"
 }
 
+tasks.register("runtimeEarlyJobsReplayTest", JavaExec) {
+	dependsOn tasks.named("testClasses")
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = "us.beiyue.beilindataportability.common.PortabilityRuntimeEarlyJobsReplayTest"
+}
+
 tasks.named("check") {
 	dependsOn tasks.named("uploadFlowTest")
 	dependsOn tasks.named("storageTest")
 	dependsOn tasks.named("litematicRoundTripTest")
-	dependsOn tasks.named("portabilityBridgeDispatchTest")
 	dependsOn tasks.named("runtimeStopTest")
+	dependsOn tasks.named("runtimeEarlyJobsReplayTest")
 }
 
 publishing {

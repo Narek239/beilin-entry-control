@@ -78,6 +78,32 @@ public final class BeilinWsClientExportJobsTest {
 		} finally {
 			BeilinWsEvents.removeExportJobsListener(lateListener);
 		}
+
+		BeilinWsClient emptyQueueClient = new BeilinWsClient(
+			config,
+			new TestHooks(),
+			new BeilinApiClient(config, routeState),
+			new EntryGateState(),
+			new TestLogger(),
+			routeState
+		);
+		try {
+			Method method = BeilinWsClient.class.getDeclaredMethod("handleTextMessage", String.class);
+			method.setAccessible(true);
+			method.invoke(emptyQueueClient, "{\"action\":\"export_jobs\",\"jobs\":[]}");
+		} finally {
+			emptyQueueClient.stop();
+		}
+		List<WsExportJob> stale = new ArrayList<>();
+		ExportJobsListener afterEmptyListener = stale::addAll;
+		BeilinWsEvents.addExportJobsListener(afterEmptyListener);
+		try {
+			if (!stale.isEmpty()) {
+				throw new AssertionError("empty export queue did not clear cached jobs");
+			}
+		} finally {
+			BeilinWsEvents.removeExportJobsListener(afterEmptyListener);
+		}
 	}
 
 	private static final class TestConfig implements CommonConfig {

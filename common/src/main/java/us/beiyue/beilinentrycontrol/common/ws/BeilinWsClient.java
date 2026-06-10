@@ -23,7 +23,6 @@ import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
-import java.lang.reflect.Method;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -675,10 +674,9 @@ public final class BeilinWsClient {
 			}
 			if ("export_jobs".equals(action)) {
 				List<WsExportJob> jobs = parseExportJobs(o);
+				BeilinWsEvents.dispatchExportJobs(jobs);
 				if (!jobs.isEmpty()) {
 					log.info("Beilin WS export queue has {} pending job(s)", jobs.size());
-					BeilinWsEvents.dispatchExportJobs(jobs);
-					forwardExportJobsToPortabilityBridge(text);
 				}
 			}
 		} catch (Exception e) {
@@ -739,21 +737,6 @@ public final class BeilinWsClient {
 		try {
 			client.connectionPool().evictAll();
 		} catch (Exception ignored) {
-		}
-	}
-
-	private void forwardExportJobsToPortabilityBridge(String text) {
-		try {
-			Class<?> bridge = Class.forName("us.beiyue.beilindataportability.common.PortabilityBridge");
-			Method accept = bridge.getMethod("acceptExportJobsJson", String.class);
-			accept.invoke(null, text);
-			Method count = bridge.getMethod("listenerCount");
-			Object listeners = count.invoke(null);
-			log.info("Beilin WS forwarded export jobs to portability bridge (listeners={})", listeners);
-		} catch (ClassNotFoundException ignored) {
-			log.debug("Beilin WS portability bridge not present");
-		} catch (Exception e) {
-			log.warn("Beilin WS portability bridge dispatch failed: {}", e.toString());
 		}
 	}
 

@@ -4,9 +4,12 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import us.beiyue.beilinentrycontrol.common.config.CommonConfig;
 import us.beiyue.beilinentrycontrol.common.log.CommonLogger;
+import us.beiyue.beilinentrycontrol.common.ws.BeilinWsEvents;
+import us.beiyue.beilinentrycontrol.common.ws.WsExportJob;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -49,8 +52,7 @@ public final class PortabilityRuntimeStopTest {
 				1_000_000
 			);
 			runtime.start();
-			assertEquals(1, PortabilityBridge.listenerCount(), "runtime should register one bridge listener");
-			PortabilityBridge.acceptExportJobsJson("{\"action\":\"export_jobs\",\"jobs\":[{\"request_id\":11,\"minecraft_username\":\"Alice\"}]}");
+			dispatchExportJobs(List.of(new WsExportJob(11L, "Alice", null, null)));
 			if (!uploadStarted.await(10, TimeUnit.SECONDS)) {
 				throw new AssertionError("upload did not start; calls=" + calls);
 			}
@@ -62,7 +64,6 @@ public final class PortabilityRuntimeStopTest {
 			if (elapsedMs > 3_000L) {
 				throw new AssertionError("runtime stop took too long: " + elapsedMs + "ms");
 			}
-			assertEquals(0, PortabilityBridge.listenerCount(), "runtime should remove bridge listener on stop");
 			if (!failSeen.await(1, TimeUnit.SECONDS)) {
 				throw new AssertionError("shutdown did not report export failure; calls=" + calls);
 			}
@@ -77,6 +78,12 @@ public final class PortabilityRuntimeStopTest {
 			serverExecutor.shutdownNow();
 			deleteTree(dir);
 		}
+	}
+
+	private static void dispatchExportJobs(List<WsExportJob> jobs) throws Exception {
+		Method dispatch = BeilinWsEvents.class.getDeclaredMethod("dispatchExportJobs", List.class);
+		dispatch.setAccessible(true);
+		dispatch.invoke(null, jobs);
 	}
 
 	private static void handle(
