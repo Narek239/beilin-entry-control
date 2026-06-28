@@ -92,6 +92,7 @@ public final class BuildingIndexStoreStorageTest {
 					"""), "placed block datetimes should be normalized");
 			}
 			assertRecordingSemantics(dir);
+			assertHistoryAuditDoesNotWriteOwnership(dir);
 			assertCompleteBoundsPlacement(dir);
 			assertStructureAuditSwitch(dir);
 			assertBoundsDeletion(dir);
@@ -183,6 +184,48 @@ public final class BuildingIndexStoreStorageTest {
 			assertEquals(1, ackStore.listPendingStructureAuditEvents(10).size(), "ack deletion should remove acknowledged audit summaries");
 		} finally {
 			ackStore.close();
+		}
+	}
+
+	private static void assertHistoryAuditDoesNotWriteOwnership(Path dir) throws Exception {
+		Path db = dir.resolve("history-audit-only.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			store.recordBulkStateChanges(
+				List.of(
+					new BulkBlockChange("minecraft:overworld", 20, 64, 0, "minecraft:air", "minecraft:stone", false, true),
+					new BulkBlockChange("minecraft:overworld", 21, 64, 0, "minecraft:stone", "minecraft:air", false, true)
+				),
+				"Alice",
+				"WORLDEDIT_UNDO"
+			);
+			store.recordBulkStateChanges(
+				List.of(capturedPlacement(30)),
+				"Alice",
+				"EFFORTLESS_REDO"
+			);
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks"), "history replay should not create ownership rows");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_authors"), "history replay should not create author contribution");
+			assertEquals(2, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox"), "history replay should still produce audit summaries");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_UNDO'
+				  AND change_type = 'mixed'
+				  AND changed_block_count = 2
+				  AND bounds_block_count = 2
+				"""), "WorldEdit undo audit should summarize replayed changes without indexing them");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'EFFORTLESS_REDO'
+				  AND change_type = 'place'
+				  AND changed_block_count = 1
+				  AND min_x = 30 AND max_x = 30
+				"""), "Effortless redo audit should summarize replayed changes without indexing them");
 		}
 	}
 

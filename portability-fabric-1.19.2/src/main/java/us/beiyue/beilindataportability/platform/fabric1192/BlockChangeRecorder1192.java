@@ -126,12 +126,12 @@ public final class BlockChangeRecorder1192 {
 
 	public static ActorContext.Scope beginWorldEditHistory(Object actor, String source) {
 		if (!recordWorldEditBulkPlacements) return null;
-		return ActorContext.pushBulkRecord(BulkPlacementIntrospection.actorName(actor), source, BlockChangeRecorder1192::flushBulkChanges);
+		return ActorContext.pushBulkRecord(BulkPlacementIntrospection.actorName(actor), source, BlockChangeRecorder1192::flushBulkAudit);
 	}
 
 	public static ActorContext.Scope beginEffortlessHistory(Object player, String source) {
 		if (!recordEffortlessBulkPlacements) return null;
-		return ActorContext.pushBulkRecord(BulkPlacementIntrospection.actorName(player), source, BlockChangeRecorder1192::flushBulkChanges);
+		return ActorContext.pushBulkRecord(BulkPlacementIntrospection.actorName(player), source, BlockChangeRecorder1192::flushBulkAudit);
 	}
 
 	public static ActorContext.Scope beginEffortlessBuild(Object player, Object context) {
@@ -322,6 +322,19 @@ public final class BlockChangeRecorder1192 {
 				return;
 			}
 			store.recordBulkStateChanges(
+				actor.bulkChanges(),
+				actor.name,
+				actor.source,
+				actor.bulkBounds(),
+				actor.bulkResultCount()
+			);
+		}
+	}
+
+	private static void flushBulkAudit(ActorContext.Actor actor) {
+		BuildingIndexStore store = storeSupplier.get();
+		if (store != null) {
+			store.recordBulkAuditOnly(
 				actor.bulkChanges(),
 				actor.name,
 				actor.source,

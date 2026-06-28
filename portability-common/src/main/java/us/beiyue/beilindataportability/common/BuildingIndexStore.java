@@ -332,6 +332,23 @@ public final class BuildingIndexStore {
 		recordBulkStateChanges(changes, actorName, source, null, -1);
 	}
 
+	public void recordBulkAuditOnly(List<BulkBlockChange> changes, String actorName, String source) {
+		recordBulkAuditOnly(changes, actorName, source, null, -1);
+	}
+
+	public void recordBulkAuditOnly(
+		List<BulkBlockChange> changes,
+		String actorName,
+		String source,
+		BulkPlacementBounds auditBounds,
+		int resultChangedBlockCount
+	) {
+		flushPendingWrites();
+		synchronized (this) {
+			recordBulkAuditOnlyNow(changes, actorName, source, auditBounds, resultChangedBlockCount);
+		}
+	}
+
 	public void recordBulkStateChanges(
 		List<BulkBlockChange> changes,
 		String actorName,
@@ -357,6 +374,10 @@ public final class BuildingIndexStore {
 		if (sourceChanges.isEmpty() && auditBounds == null) return;
 		String actor = displayActorName(actorName);
 		if (!isPlayerActor(actor)) return;
+		if (isHistorySource(source)) {
+			recordBulkAuditOnlyNow(sourceChanges, actor, source, auditBounds, resultChangedBlockCount);
+			return;
+		}
 		List<PendingChange> pending = new ArrayList<>();
 		StructureAuditEvent.Accumulator capturedAudit = structureAuditEnabled && auditBounds == null
 			? StructureAuditEvent.accumulator(actor, source)
@@ -425,6 +446,67 @@ public final class BuildingIndexStore {
 			} catch (SQLException ignored) {
 			}
 			log.warn("Failed to apply portability bulk block changes from {}: {}", source, e.toString());
+		} finally {
+			try {
+				connection.setAutoCommit(originalAutoCommit);
+			} catch (SQLException ignored) {
+			}
+		}
+	}
+
+	private void recordBulkAuditOnlyNow(
+		List<BulkBlockChange> changes,
+		String actorName,
+		String source,
+		BulkPlacementBounds auditBounds,
+		int resultChangedBlockCount
+	) {
+		if (closed || !structureAuditEnabled) return;
+		List<BulkBlockChange> sourceChanges = changes != null ? changes : List.of();
+		if (sourceChanges.isEmpty() && auditBounds == null) return;
+		String actor = displayActorName(actorName);
+		if (!isPlayerActor(actor)) return;
+		String now = SqliteUtcDatetimes.now();
+		List<StructureAuditEvent> auditEvents = List.of();
+		if (auditBounds != null) {
+			int changedBlockCount = resultChangedBlockCount >= 0
+				? resultChangedBlockCount
+				: (sourceChanges.isEmpty() ? -1 : sourceChanges.size());
+			StructureAuditEvent event = StructureAuditEvent.fromBounds(
+				auditBounds,
+				actor,
+				source,
+				auditChangeType(sourceChanges),
+				changedBlockCount,
+				now
+			);
+			auditEvents = event != null ? List.of(event) : List.of();
+		} else {
+			StructureAuditEvent.Accumulator accumulator = StructureAuditEvent.accumulator(actor, source);
+			Set<BlockCoordinate> seenCoordinates = new HashSet<>();
+			for (BulkBlockChange change : sourceChanges) {
+				if (change == null || change.newBlockState == null || change.newBlockState.isBlank()) continue;
+				String dimension = dimensionName(change.dimension);
+				if (!seenCoordinates.add(new BlockCoordinate(dimension, change.x, change.y, change.z))) continue;
+				accumulator.include(dimension, change.x, change.y, change.z, change.newBlockState);
+			}
+			auditEvents = accumulator.toEvents(now, resultChangedBlockCount);
+		}
+		if (auditEvents.isEmpty()) return;
+		boolean originalAutoCommit = true;
+		try {
+			originalAutoCommit = connection.getAutoCommit();
+			connection.setAutoCommit(false);
+			for (StructureAuditEvent event : auditEvents) {
+				insertStructureAuditEvent(event);
+			}
+			connection.commit();
+		} catch (SQLException e) {
+			try {
+				connection.rollback();
+			} catch (SQLException ignored) {
+			}
+			log.warn("Failed to record portability bulk audit from {}: {}", source, e.toString());
 		} finally {
 			try {
 				connection.setAutoCommit(originalAutoCommit);
@@ -1775,6 +1857,15 @@ public final class BuildingIndexStore {
 
 	private static String safeDimension(String s) {
 		return (s == null ? "world" : s).replace(':', '_').replace('/', '_');
+	}
+
+	private static boolean isHistorySource(String source) {
+		if (source == null) return false;
+		String s = source.trim().toUpperCase(Locale.ROOT);
+		return "WORLDEDIT_UNDO".equals(s)
+			|| "WORLDEDIT_REDO".equals(s)
+			|| "EFFORTLESS_UNDO".equals(s)
+			|| "EFFORTLESS_REDO".equals(s);
 	}
 
 	private static boolean isAirState(String state) {
