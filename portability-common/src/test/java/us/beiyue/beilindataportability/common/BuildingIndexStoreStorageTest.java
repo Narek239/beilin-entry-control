@@ -315,24 +315,38 @@ public final class BuildingIndexStoreStorageTest {
 				store.tryRecordCompleteBoundsPlacement(bounds, "Alice", "WORLDEDIT_SET", 14_300),
 				"complete non-linear //set bounds should use the set-based fast path"
 			);
-			assertTrue(
+			assertFalse(
 				store.tryRecordCompleteBoundsPlacement(partialBounds, "Alice", "WORLDEDIT_SET", 17),
-				"partial //set result should still use the bounds fast path"
+				"partial //set result should not claim the full bounds"
 			);
-			assertTrue(
+			store.recordBulkStateChanges(List.of(), "Alice", "WORLDEDIT_SET", partialBounds, 17);
+			assertFalse(
 				store.tryRecordCompleteBoundsPlacement(zeroResultBounds, "Alice", "WORLDEDIT_SET", 0),
-				"zero-result //set should still use the bounds fast path"
+				"zero-result //set should not claim the full bounds"
 			);
+			store.recordBulkStateChanges(List.of(), "Alice", "WORLDEDIT_SET", zeroResultBounds, 0);
 		} finally {
 			store.close();
 		}
 		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
 			 Statement s = c.createStatement()) {
-			assertEquals(15_100, scalarInt(s, "SELECT COUNT(*) FROM region_blocks"), "bounds fast paths should insert every coordinate once");
-			assertEquals(3, scalarInt(s, "SELECT COUNT(*) FROM building_regions"), "separate bounds should remain separate regions");
-			assertEquals(15_100, scalarInt(s, "SELECT SUM(volume_blocks) FROM building_regions"), "region bounds should retain all cuboid volumes");
-			assertEquals(15_101, scalarInt(s, "SELECT SUM(first_place_count) FROM region_authors WHERE player_name_key = 'alice'"), "bounds should aggregate author placement counts");
-			assertEquals(15_101, scalarInt(s, "SELECT SUM(last_modify_count) FROM region_authors WHERE player_name_key = 'alice'"), "bounds should aggregate author modification counts");
+			assertEquals(14_300, scalarInt(s, "SELECT COUNT(*) FROM region_blocks"), "only exact complete-bounds results should insert every coordinate");
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM building_regions"), "partial and zero-result bounds should not create indexed regions");
+			assertEquals(14_300, scalarInt(s, "SELECT SUM(volume_blocks) FROM building_regions"), "region bounds should only retain exact complete cuboids");
+			assertEquals(14_301, scalarInt(s, "SELECT SUM(first_place_count) FROM region_authors WHERE player_name_key = 'alice'"), "only exact bounds should aggregate author placement counts");
+			assertEquals(14_301, scalarInt(s, "SELECT SUM(last_modify_count) FROM region_authors WHERE player_name_key = 'alice'"), "only exact bounds should aggregate author modification counts");
+			assertEquals(0, scalarInt(s, """
+				SELECT COUNT(*) FROM region_blocks
+				WHERE x BETWEEN 1200 AND 1219
+				  AND y = 64
+				  AND z BETWEEN 20 AND 39
+				"""), "partial bounds should not write ownership coordinates");
+			assertEquals(0, scalarInt(s, """
+				SELECT COUNT(*) FROM region_blocks
+				WHERE x BETWEEN 1300 AND 1319
+				  AND y = 64
+				  AND z BETWEEN 20 AND 39
+				"""), "zero-result bounds should not write ownership coordinates");
 			assertEquals(1, scalarInt(s, """
 				SELECT COUNT(*) FROM structure_audit_outbox
 				WHERE source = 'WORLDEDIT_SET'
@@ -350,7 +364,7 @@ public final class BuildingIndexStoreStorageTest {
 				  AND min_x = 1200 AND max_x = 1219
 				  AND min_y = 64 AND max_y = 64
 				  AND min_z = 20 AND max_z = 39
-				"""), "partial result should retain its exact audit count while indexing the full bounds");
+				"""), "partial result should retain its exact audit count without indexing the full bounds");
 			assertEquals(1, scalarInt(s, """
 				SELECT COUNT(*) FROM structure_audit_outbox
 				WHERE source = 'WORLDEDIT_SET'
@@ -359,7 +373,7 @@ public final class BuildingIndexStoreStorageTest {
 				  AND min_x = 1300 AND max_x = 1319
 				  AND min_y = 64 AND max_y = 64
 				  AND min_z = 20 AND max_z = 39
-				"""), "zero result should retain its audit count while indexing the full bounds");
+				"""), "zero result should retain its audit count without indexing the full bounds");
 		}
 	}
 
@@ -725,6 +739,7 @@ public final class BuildingIndexStoreStorageTest {
 			assertEquals(ActorContext.RecordingMode.BULK_COMPLETE_BOUNDS, actor.recordingMode, "complete bounds mode should be selected before block updates begin");
 			assertTrue(actor.shouldIgnoreBlockRecords(), "complete bounds mode should suppress per-block capture");
 			assertFalse(actor.shouldForcePlacementRecords(), "complete bounds mode should not create BulkBlockChange objects");
+			assertFalse(actor.isCompleteBoundsPlacement(), "unknown result count should not enable the complete bounds SQL path");
 			actor.addBulkChange(capturedPlacement(0));
 			assertEquals(0, actor.bulkChanges().size(), "complete bounds mode should keep the bulk buffer empty");
 			actor.setBulkResultCount(1_000);
@@ -742,7 +757,7 @@ public final class BuildingIndexStoreStorageTest {
 		)) {
 			ActorContext.Actor actor = ActorContext.current();
 			actor.setBulkResultCount(999);
-			assertTrue(actor.isCompleteBoundsPlacement(), "partial results should retain the complete-bounds SQL path");
+			assertFalse(actor.isCompleteBoundsPlacement(), "partial results should not enable the complete-bounds SQL path");
 			assertEquals(0, actor.bulkChanges().size(), "complete-bounds mode should remain summary-only");
 		}
 

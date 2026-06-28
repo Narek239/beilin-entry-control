@@ -554,6 +554,7 @@ public final class BuildingIndexStore {
 		if (!isPlayerActor(actor)) return false;
 		int volume = bounds.volumeBlockCount();
 		if (volume <= 0) return false;
+		if (changedBlockCount != volume) return false;
 		Bounds placedBounds = new Bounds(bounds.minX, bounds.minY, bounds.minZ, bounds.maxX, bounds.maxY, bounds.maxZ);
 		if (isLinearInfrastructure(placedBounds, volume)) return false;
 

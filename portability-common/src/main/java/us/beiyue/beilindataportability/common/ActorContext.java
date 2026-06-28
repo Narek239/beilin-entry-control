@@ -248,7 +248,8 @@ public final class ActorContext {
 		public boolean isCompleteBoundsPlacement() {
 			return recordingMode == RecordingMode.BULK_COMPLETE_BOUNDS
 				&& completeBoundsCandidate
-				&& bulkBounds != null;
+				&& bulkBounds != null
+				&& bulkResultCount == bulkBounds.volumeBlockCount();
 		}
 	}
 }
