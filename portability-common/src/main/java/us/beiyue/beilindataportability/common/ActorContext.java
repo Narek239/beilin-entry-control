@@ -3,12 +3,14 @@ package us.beiyue.beilindataportability.common;
 import java.util.Locale;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.function.Consumer;
 
 public final class ActorContext {
 	public static final String SYSTEM_ACTOR = "SYSTEM";
 	public static final String UNKNOWN_ACTOR = "UNKNOWN";
 	private static final int DEFAULT_BLOCK_ACTION_RADIUS = 3;
+	private static final int BULK_STREAM_BATCH_SIZE = 1_000;
 
 	private static final ThreadLocal<Actor> CURRENT = new ThreadLocal<>();
 
@@ -58,6 +60,47 @@ public final class ActorContext {
 			null,
 			completeBoundsCandidate,
 			flush
+		));
+		return new Scope(previous);
+	}
+
+	public static Scope pushStreamingBulkRecord(
+		String actorName,
+		String source,
+		BulkBatchConsumer batchFlush,
+		Consumer<Actor> finishFlush,
+		Consumer<Actor> abortFlush
+	) {
+		return pushStreamingBulkRecord(actorName, source, null, false, batchFlush, finishFlush, abortFlush);
+	}
+
+	public static Scope pushStreamingBulkRecord(
+		String actorName,
+		String source,
+		BulkPlacementBounds bounds,
+		boolean completeBoundsCandidate,
+		BulkBatchConsumer batchFlush,
+		Consumer<Actor> finishFlush,
+		Consumer<Actor> abortFlush
+	) {
+		Actor previous = CURRENT.get();
+		RecordingMode recordingMode = completeBoundsCandidate && bounds != null
+			? RecordingMode.BULK_COMPLETE_BOUNDS
+			: RecordingMode.BULK_RECORD;
+		CURRENT.set(new Actor(
+			displayActorName(actorName),
+			sourceName(source),
+			null,
+			null,
+			null,
+			0,
+			recordingMode,
+			bounds,
+			null,
+			completeBoundsCandidate,
+			finishFlush,
+			batchFlush,
+			abortFlush
 		));
 		return new Scope(previous);
 	}
@@ -129,8 +172,18 @@ public final class ActorContext {
 			closed = true;
 			Actor current = CURRENT.get();
 			try {
-				if (flush && current != null && current.bulkFlush != null) {
-					current.bulkFlush.accept(current);
+				if (current != null) {
+					if (flush) {
+						current.flushBulkBatch();
+						if (current.bulkFlush != null) {
+							current.bulkFlush.accept(current);
+						}
+					} else {
+						current.discardBulkBuffer();
+						if (current.bulkAbort != null) {
+							current.bulkAbort.accept(current);
+						}
+					}
 				}
 			} finally {
 				if (previous == null) {
@@ -150,6 +203,11 @@ public final class ActorContext {
 		BULK_IGNORE
 	}
 
+	@FunctionalInterface
+	public interface BulkBatchConsumer {
+		boolean accept(Actor actor, List<BulkBlockChange> changes);
+	}
+
 	public static final class Actor {
 		public final String name;
 		public final String nameKey;
@@ -163,8 +221,12 @@ public final class ActorContext {
 		private final String bulkChangeType;
 		private final boolean completeBoundsCandidate;
 		private final Consumer<Actor> bulkFlush;
-		private final List<BulkBlockChange> bulkChanges = new ArrayList<>();
+		private final BulkBatchConsumer bulkBatchFlush;
+		private final Consumer<Actor> bulkAbort;
+		private final String bulkOperationId;
+		private final List<BulkBlockChange> bulkChanges = new ArrayList<>(BULK_STREAM_BATCH_SIZE);
 		private int bulkResultCount = -1;
+		private boolean bulkStreamFailed;
 
 		private Actor(
 			String name,
@@ -179,6 +241,38 @@ public final class ActorContext {
 			boolean completeBoundsCandidate,
 			Consumer<Actor> bulkFlush
 		) {
+			this(
+				name,
+				source,
+				originX,
+				originY,
+				originZ,
+				radius,
+				recordingMode,
+				bulkBounds,
+				bulkChangeType,
+				completeBoundsCandidate,
+				bulkFlush,
+				null,
+				null
+			);
+		}
+
+		private Actor(
+			String name,
+			String source,
+			Integer originX,
+			Integer originY,
+			Integer originZ,
+			int radius,
+			RecordingMode recordingMode,
+			BulkPlacementBounds bulkBounds,
+			String bulkChangeType,
+			boolean completeBoundsCandidate,
+			Consumer<Actor> bulkFlush,
+			BulkBatchConsumer bulkBatchFlush,
+			Consumer<Actor> bulkAbort
+		) {
 			this.name = name;
 			this.nameKey = normalizeName(name);
 			this.source = source;
@@ -191,6 +285,9 @@ public final class ActorContext {
 			this.bulkChangeType = changeTypeName(bulkChangeType);
 			this.completeBoundsCandidate = completeBoundsCandidate;
 			this.bulkFlush = bulkFlush;
+			this.bulkBatchFlush = bulkBatchFlush;
+			this.bulkAbort = bulkAbort;
+			this.bulkOperationId = bulkBatchFlush != null ? UUID.randomUUID().toString() : null;
 		}
 
 		public boolean isSystemLike() {
@@ -217,8 +314,11 @@ public final class ActorContext {
 		}
 
 		public void addBulkChange(BulkBlockChange change) {
-			if (recordingMode != RecordingMode.BULK_RECORD || change == null) return;
+			if (recordingMode != RecordingMode.BULK_RECORD || change == null || bulkStreamFailed) return;
 			bulkChanges.add(change);
+			if (bulkChanges.size() >= BULK_STREAM_BATCH_SIZE) {
+				flushBulkBatch();
+			}
 		}
 
 		public BulkPlacementBounds bulkBounds() {
@@ -231,6 +331,33 @@ public final class ActorContext {
 
 		public List<BulkBlockChange> bulkChanges() {
 			return List.copyOf(bulkChanges);
+		}
+
+		public String bulkOperationId() {
+			return bulkOperationId;
+		}
+
+		public boolean bulkStreamFailed() {
+			return bulkStreamFailed;
+		}
+
+		private void flushBulkBatch() {
+			if (bulkBatchFlush == null || bulkChanges.isEmpty() || bulkStreamFailed) return;
+			List<BulkBlockChange> batch = List.copyOf(bulkChanges);
+			bulkChanges.clear();
+			boolean accepted;
+			try {
+				accepted = bulkBatchFlush.accept(this, batch);
+			} catch (RuntimeException e) {
+				accepted = false;
+			}
+			if (!accepted) {
+				bulkStreamFailed = true;
+			}
+		}
+
+		private void discardBulkBuffer() {
+			bulkChanges.clear();
 		}
 
 		public void setBulkResultCount(int count) {

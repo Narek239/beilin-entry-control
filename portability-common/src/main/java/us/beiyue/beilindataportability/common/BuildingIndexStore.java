@@ -169,6 +169,17 @@ public final class BuildingIndexStore {
 		}
 	}
 
+	private void enqueueStagedBulkFinish(StagedBulkFinishCommand command) {
+		if (command == null || command.operationId == null || command.operationId.isBlank()) return;
+		synchronized (writerStateLock) {
+			if (!acceptingWrites || closed) {
+				deleteStagedBulkStateChangesNow(command.operationId);
+				return;
+			}
+			writeQueue.offer(command);
+		}
+	}
+
 	private void putWriterCommand(WriteCommand command) {
 		boolean interrupted = false;
 		while (true) {
@@ -204,11 +215,13 @@ public final class BuildingIndexStore {
 							deferred = next;
 							break;
 						}
-					}
-					applyQueuedStateChanges(batch);
-				} else if (command instanceof BarrierCommand barrier) {
-					barrier.complete();
-				} else if (command == StopCommand.INSTANCE) {
+						}
+						applyQueuedStateChanges(batch);
+					} else if (command instanceof StagedBulkFinishCommand bulkFinish) {
+						applyStagedBulkFinishCommand(bulkFinish);
+					} else if (command instanceof BarrierCommand barrier) {
+						barrier.complete();
+					} else if (command == StopCommand.INSTANCE) {
 					return;
 				}
 			}
@@ -251,6 +264,32 @@ public final class BuildingIndexStore {
 					connection.setAutoCommit(originalAutoCommit);
 				} catch (SQLException ignored) {
 				}
+			}
+		}
+	}
+
+	private void applyStagedBulkFinishCommand(StagedBulkFinishCommand command) {
+		synchronized (this) {
+			if (closed) {
+				deleteStagedBulkStateChangesNow(command.operationId);
+				return;
+			}
+			if (command.auditOnly) {
+				finishStagedBulkAuditOnlyNow(
+					command.operationId,
+					command.actorName,
+					command.source,
+					command.auditBounds,
+					command.resultChangedBlockCount
+				);
+			} else {
+				finishStagedBulkStateChangesNow(
+					command.operationId,
+					command.actorName,
+					command.source,
+					command.auditBounds,
+					command.resultChangedBlockCount
+				);
 			}
 		}
 	}
@@ -347,6 +386,52 @@ public final class BuildingIndexStore {
 		synchronized (this) {
 			recordBulkAuditOnlyNow(changes, actorName, source, auditBounds, resultChangedBlockCount);
 		}
+	}
+
+	public boolean stageBulkStateChanges(String operationId, List<BulkBlockChange> changes) {
+		synchronized (this) {
+			return stageBulkStateChangesNow(operationId, changes);
+		}
+	}
+
+	public void discardStagedBulkStateChanges(String operationId) {
+		synchronized (this) {
+			deleteStagedBulkStateChangesNow(operationId);
+		}
+	}
+
+	public void finishStagedBulkStateChanges(
+		String operationId,
+		String actorName,
+		String source,
+		BulkPlacementBounds auditBounds,
+		int resultChangedBlockCount
+	) {
+		enqueueStagedBulkFinish(new StagedBulkFinishCommand(
+			operationId,
+			actorName,
+			source,
+			auditBounds,
+			resultChangedBlockCount,
+			isHistorySource(source)
+		));
+	}
+
+	public void finishStagedBulkAuditOnly(
+		String operationId,
+		String actorName,
+		String source,
+		BulkPlacementBounds auditBounds,
+		int resultChangedBlockCount
+	) {
+		enqueueStagedBulkFinish(new StagedBulkFinishCommand(
+			operationId,
+			actorName,
+			source,
+			auditBounds,
+			resultChangedBlockCount,
+			true
+		));
 	}
 
 	public void recordBulkStateChanges(
@@ -446,6 +531,223 @@ public final class BuildingIndexStore {
 			} catch (SQLException ignored) {
 			}
 			log.warn("Failed to apply portability bulk block changes from {}: {}", source, e.toString());
+		} finally {
+			try {
+				connection.setAutoCommit(originalAutoCommit);
+			} catch (SQLException ignored) {
+			}
+		}
+	}
+
+	private boolean stageBulkStateChangesNow(String operationId, List<BulkBlockChange> changes) {
+		if (closed || operationId == null || operationId.isBlank()) return false;
+		if (changes == null || changes.isEmpty()) return true;
+		boolean originalAutoCommit = true;
+		try {
+			ensureBulkStageTable();
+			originalAutoCommit = connection.getAutoCommit();
+			connection.setAutoCommit(false);
+			try (PreparedStatement ps = connection.prepareStatement("""
+				INSERT OR IGNORE INTO bulk_change_stage (
+					operation_id, dimension, x, y, z,
+					old_block_state, new_block_state, old_block_replaceable, force_placement
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				""")) {
+				int batched = 0;
+				for (BulkBlockChange change : changes) {
+					if (change == null || change.newBlockState == null || change.newBlockState.isBlank()) continue;
+					ps.setString(1, operationId);
+					ps.setString(2, dimensionName(change.dimension));
+					ps.setInt(3, change.x);
+					ps.setInt(4, change.y);
+					ps.setInt(5, change.z);
+					ps.setString(6, change.oldBlockState);
+					ps.setString(7, change.newBlockState);
+					ps.setInt(8, change.oldBlockReplaceable ? 1 : 0);
+					ps.setInt(9, change.forcePlacement ? 1 : 0);
+					ps.addBatch();
+					if (++batched >= WRITE_BATCH_SIZE) {
+						ps.executeBatch();
+						ps.clearBatch();
+						batched = 0;
+					}
+				}
+				if (batched > 0) ps.executeBatch();
+			}
+			connection.commit();
+			return true;
+		} catch (SQLException e) {
+			try {
+				connection.rollback();
+			} catch (SQLException ignored) {
+			}
+			log.warn("Failed to stage portability bulk block changes: {}", e.toString());
+			return false;
+		} finally {
+			try {
+				connection.setAutoCommit(originalAutoCommit);
+			} catch (SQLException ignored) {
+			}
+		}
+	}
+
+	private void finishStagedBulkStateChangesNow(
+		String operationId,
+		String actorName,
+		String source,
+		BulkPlacementBounds auditBounds,
+		int resultChangedBlockCount
+	) {
+		if (closed || operationId == null || operationId.isBlank()) return;
+		String actor = displayActorName(actorName);
+		if (!isPlayerActor(actor)) {
+			deleteStagedBulkStateChangesNow(operationId);
+			return;
+		}
+		boolean originalAutoCommit = true;
+		String now = SqliteUtcDatetimes.now();
+		try {
+			ensureBulkStageTable();
+			originalAutoCommit = connection.getAutoCommit();
+			connection.setAutoCommit(false);
+			long lastRowId = 0L;
+			int appliedCount = 0;
+			BulkAuditTally auditTally = new BulkAuditTally();
+			StructureAuditEvent.Accumulator capturedAudit = structureAuditEnabled && auditBounds == null
+				? StructureAuditEvent.accumulator(actor, source)
+				: null;
+			while (true) {
+				List<StagedBulkChange> page = stagedBulkChangesPage(operationId, lastRowId);
+				if (page.isEmpty()) break;
+				Set<Long> affectedRegionIds = new HashSet<>();
+					BulkMutationBuffer mutationBuffer = new BulkMutationBuffer();
+					for (StagedBulkChange staged : page) {
+						lastRowId = staged.rowId;
+						auditTally.include(staged.newBlockState);
+					PendingChange pendingChange = staged.toPendingChange(actor);
+					if (shouldApplyChange(pendingChange)) {
+						appliedCount += 1;
+						if (capturedAudit != null) {
+							capturedAudit.include(
+								pendingChange.dimension,
+								pendingChange.x,
+								pendingChange.y,
+								pendingChange.z,
+								pendingChange.newBlockState
+							);
+						}
+						long affectedRegionId = applyChange(pendingChange, now, mutationBuffer);
+						if (affectedRegionId >= 0) affectedRegionIds.add(affectedRegionId);
+					}
+				}
+				flushBulkMutations(mutationBuffer, now);
+				finishRegionMaintenance(affectedRegionIds);
+			}
+			List<StructureAuditEvent> auditEvents = List.of();
+			if (structureAuditEnabled && auditBounds != null) {
+				int changedBlockCount = resultChangedBlockCount >= 0
+					? resultChangedBlockCount
+					: (appliedCount == 0 ? -1 : appliedCount);
+				StructureAuditEvent event = StructureAuditEvent.fromBounds(
+					auditBounds,
+					actor,
+					source,
+					auditTally.changeType(),
+					changedBlockCount,
+					now
+				);
+				auditEvents = event != null ? List.of(event) : List.of();
+			} else if (capturedAudit != null) {
+				auditEvents = capturedAudit.toEvents(now, resultChangedBlockCount);
+			}
+			for (StructureAuditEvent event : auditEvents) {
+				insertStructureAuditEvent(event);
+			}
+			deleteStagedBulkStateChangesInTransaction(operationId);
+			connection.commit();
+		} catch (SQLException e) {
+			try {
+				connection.rollback();
+			} catch (SQLException ignored) {
+			}
+			log.warn("Failed to apply staged portability bulk block changes from {}: {}", source, e.toString());
+		} finally {
+			try {
+				connection.setAutoCommit(originalAutoCommit);
+			} catch (SQLException ignored) {
+			}
+		}
+	}
+
+	private void finishStagedBulkAuditOnlyNow(
+		String operationId,
+		String actorName,
+		String source,
+		BulkPlacementBounds auditBounds,
+		int resultChangedBlockCount
+	) {
+		if (operationId == null || operationId.isBlank()) return;
+		if (closed || !structureAuditEnabled) {
+			deleteStagedBulkStateChangesNow(operationId);
+			return;
+		}
+		String actor = displayActorName(actorName);
+		if (!isPlayerActor(actor)) {
+			deleteStagedBulkStateChangesNow(operationId);
+			return;
+		}
+		boolean originalAutoCommit = true;
+		String now = SqliteUtcDatetimes.now();
+		try {
+			ensureBulkStageTable();
+			originalAutoCommit = connection.getAutoCommit();
+			connection.setAutoCommit(false);
+			long lastRowId = 0L;
+			int stagedCount = 0;
+			BulkAuditTally auditTally = new BulkAuditTally();
+			StructureAuditEvent.Accumulator accumulator = auditBounds == null
+				? StructureAuditEvent.accumulator(actor, source)
+				: null;
+			while (true) {
+				List<StagedBulkChange> page = stagedBulkChangesPage(operationId, lastRowId);
+				if (page.isEmpty()) break;
+				for (StagedBulkChange staged : page) {
+					lastRowId = staged.rowId;
+					stagedCount += 1;
+					auditTally.include(staged.newBlockState);
+					if (accumulator != null) {
+						accumulator.include(staged.dimension, staged.x, staged.y, staged.z, staged.newBlockState);
+					}
+				}
+			}
+			List<StructureAuditEvent> auditEvents;
+			if (auditBounds != null) {
+				int changedBlockCount = resultChangedBlockCount >= 0
+					? resultChangedBlockCount
+					: (stagedCount == 0 ? -1 : stagedCount);
+				StructureAuditEvent event = StructureAuditEvent.fromBounds(
+					auditBounds,
+					actor,
+					source,
+					auditTally.changeType(),
+					changedBlockCount,
+					now
+				);
+				auditEvents = event != null ? List.of(event) : List.of();
+			} else {
+				auditEvents = accumulator != null ? accumulator.toEvents(now, resultChangedBlockCount) : List.of();
+			}
+			for (StructureAuditEvent event : auditEvents) {
+				insertStructureAuditEvent(event);
+			}
+			deleteStagedBulkStateChangesInTransaction(operationId);
+			connection.commit();
+		} catch (SQLException e) {
+			try {
+				connection.rollback();
+			} catch (SQLException ignored) {
+			}
+			log.warn("Failed to record staged portability bulk audit from {}: {}", source, e.toString());
 		} finally {
 			try {
 				connection.setAutoCommit(originalAutoCommit);
@@ -1653,6 +1955,79 @@ public final class BuildingIndexStore {
 		}
 	}
 
+	private void ensureBulkStageTable() throws SQLException {
+		try (Statement stmt = connection.createStatement()) {
+			stmt.execute("""
+				CREATE TEMP TABLE IF NOT EXISTS bulk_change_stage (
+					row_id INTEGER PRIMARY KEY,
+					operation_id TEXT NOT NULL,
+					dimension TEXT NOT NULL,
+					x INTEGER NOT NULL,
+					y INTEGER NOT NULL,
+					z INTEGER NOT NULL,
+					old_block_state TEXT,
+					new_block_state TEXT NOT NULL,
+					old_block_replaceable INTEGER NOT NULL DEFAULT 0,
+					force_placement INTEGER NOT NULL DEFAULT 0,
+					UNIQUE(operation_id, dimension, x, y, z)
+				)
+				""");
+			stmt.execute("CREATE INDEX IF NOT EXISTS temp.idx_bulk_change_stage_operation_row ON bulk_change_stage(operation_id, row_id)");
+		}
+	}
+
+	private List<StagedBulkChange> stagedBulkChangesPage(String operationId, long afterRowId) throws SQLException {
+		try (PreparedStatement ps = connection.prepareStatement("""
+			SELECT row_id, dimension, x, y, z,
+			       old_block_state, new_block_state,
+			       old_block_replaceable, force_placement
+			FROM bulk_change_stage
+			WHERE operation_id = ? AND row_id > ?
+			ORDER BY row_id
+			LIMIT ?
+			""")) {
+			ps.setString(1, operationId);
+			ps.setLong(2, afterRowId);
+			ps.setInt(3, WRITE_BATCH_SIZE);
+			try (ResultSet rs = ps.executeQuery()) {
+				List<StagedBulkChange> out = new ArrayList<>(WRITE_BATCH_SIZE);
+				while (rs.next()) {
+					out.add(new StagedBulkChange(
+						rs.getLong("row_id"),
+						rs.getString("dimension"),
+						rs.getInt("x"),
+						rs.getInt("y"),
+						rs.getInt("z"),
+						rs.getString("old_block_state"),
+						rs.getString("new_block_state"),
+						rs.getInt("old_block_replaceable") != 0,
+						rs.getInt("force_placement") != 0
+					));
+				}
+				return out;
+			}
+		}
+	}
+
+	private void deleteStagedBulkStateChangesNow(String operationId) {
+		if (operationId == null || operationId.isBlank()) return;
+		try {
+			ensureBulkStageTable();
+			deleteStagedBulkStateChangesInTransaction(operationId);
+		} catch (SQLException e) {
+			log.warn("Failed to discard staged portability bulk changes: {}", e.toString());
+		}
+	}
+
+	private void deleteStagedBulkStateChangesInTransaction(String operationId) throws SQLException {
+		try (PreparedStatement ps = connection.prepareStatement(
+			"DELETE FROM bulk_change_stage WHERE operation_id = ?"
+		)) {
+			ps.setString(1, operationId);
+			ps.executeUpdate();
+		}
+	}
+
 	private int countRegions() {
 		try (Statement stmt = connection.createStatement();
 			 ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM building_regions WHERE status = 'active'")) {
@@ -1881,6 +2256,31 @@ public final class BuildingIndexStore {
 	private interface WriteCommand {
 	}
 
+	private static final class StagedBulkFinishCommand implements WriteCommand {
+		final String operationId;
+		final String actorName;
+		final String source;
+		final BulkPlacementBounds auditBounds;
+		final int resultChangedBlockCount;
+		final boolean auditOnly;
+
+		StagedBulkFinishCommand(
+			String operationId,
+			String actorName,
+			String source,
+			BulkPlacementBounds auditBounds,
+			int resultChangedBlockCount,
+			boolean auditOnly
+		) {
+			this.operationId = operationId;
+			this.actorName = actorName;
+			this.source = source;
+			this.auditBounds = auditBounds;
+			this.resultChangedBlockCount = resultChangedBlockCount;
+			this.auditOnly = auditOnly;
+		}
+	}
+
 	private static final class BarrierCommand implements WriteCommand {
 		private final CountDownLatch completed = new CountDownLatch(1);
 
@@ -1944,6 +2344,72 @@ public final class BuildingIndexStore {
 			this.y = y;
 			this.z = z;
 			this.placement = placement;
+		}
+	}
+
+	private static final class BulkAuditTally {
+		private boolean hasPlace;
+		private boolean hasDelete;
+
+		void include(String newBlockState) {
+			if (newBlockState == null || newBlockState.isBlank()) return;
+			if (isAirState(newBlockState)) hasDelete = true;
+			else hasPlace = true;
+		}
+
+		String changeType() {
+			if (hasPlace && hasDelete) return "mixed";
+			if (hasDelete) return "delete";
+			if (hasPlace) return "place";
+			return "mixed";
+		}
+	}
+
+	private static final class StagedBulkChange {
+		final long rowId;
+		final String dimension;
+		final int x;
+		final int y;
+		final int z;
+		final String oldBlockState;
+		final String newBlockState;
+		final boolean oldBlockReplaceable;
+		final boolean forcePlacement;
+
+		StagedBulkChange(
+			long rowId,
+			String dimension,
+			int x,
+			int y,
+			int z,
+			String oldBlockState,
+			String newBlockState,
+			boolean oldBlockReplaceable,
+			boolean forcePlacement
+		) {
+			this.rowId = rowId;
+			this.dimension = dimension;
+			this.x = x;
+			this.y = y;
+			this.z = z;
+			this.oldBlockState = oldBlockState;
+			this.newBlockState = newBlockState;
+			this.oldBlockReplaceable = oldBlockReplaceable;
+			this.forcePlacement = forcePlacement;
+		}
+
+		PendingChange toPendingChange(String actorName) {
+			return new PendingChange(
+				dimension,
+				x,
+				y,
+				z,
+				oldBlockState,
+				newBlockState,
+				actorName,
+				oldBlockReplaceable,
+				forcePlacement
+			);
 		}
 	}
 

@@ -11,6 +11,7 @@ import us.beiyue.beilindataportability.common.BulkPlacementIntrospection;
 import us.beiyue.beilindataportability.common.BuildingIndexStore;
 
 import java.util.ArrayDeque;
+import java.util.List;
 import java.util.function.Supplier;
 
 public final class BlockChangeRecorder1192 {
@@ -126,12 +127,24 @@ public final class BlockChangeRecorder1192 {
 
 	public static ActorContext.Scope beginWorldEditHistory(Object actor, String source) {
 		if (!recordWorldEditBulkPlacements) return null;
-		return ActorContext.pushBulkRecord(BulkPlacementIntrospection.actorName(actor), source, BlockChangeRecorder1192::flushBulkAudit);
+		return ActorContext.pushStreamingBulkRecord(
+			BulkPlacementIntrospection.actorName(actor),
+			source,
+			BlockChangeRecorder1192::stageBulkChanges,
+			BlockChangeRecorder1192::flushBulkAudit,
+			BlockChangeRecorder1192::abortBulkChanges
+		);
 	}
 
 	public static ActorContext.Scope beginEffortlessHistory(Object player, String source) {
 		if (!recordEffortlessBulkPlacements) return null;
-		return ActorContext.pushBulkRecord(BulkPlacementIntrospection.actorName(player), source, BlockChangeRecorder1192::flushBulkAudit);
+		return ActorContext.pushStreamingBulkRecord(
+			BulkPlacementIntrospection.actorName(player),
+			source,
+			BlockChangeRecorder1192::stageBulkChanges,
+			BlockChangeRecorder1192::flushBulkAudit,
+			BlockChangeRecorder1192::abortBulkChanges
+		);
 	}
 
 	public static ActorContext.Scope beginEffortlessBuild(Object player, Object context) {
@@ -280,12 +293,14 @@ public final class BlockChangeRecorder1192 {
 				}
 			});
 		}
-		return ActorContext.pushBulkRecord(
+		return ActorContext.pushStreamingBulkRecord(
 			actorName,
 			source,
 			bounds,
 			completeBoundsCandidate,
-			BlockChangeRecorder1192::flushBulkChanges
+			BlockChangeRecorder1192::stageBulkChanges,
+			BlockChangeRecorder1192::flushBulkChanges,
+			BlockChangeRecorder1192::abortBulkChanges
 		);
 	}
 
@@ -294,7 +309,15 @@ public final class BlockChangeRecorder1192 {
 	}
 
 	private static ActorContext.Scope beginBulkDeleteBounds(String actorName, String source, BulkPlacementBounds bounds, String changeType) {
-		if (bounds == null) return ActorContext.pushBulkRecord(actorName, source, BlockChangeRecorder1192::flushBulkChanges);
+		if (bounds == null) {
+			return ActorContext.pushStreamingBulkRecord(
+				actorName,
+				source,
+				BlockChangeRecorder1192::stageBulkChanges,
+				BlockChangeRecorder1192::flushBulkChanges,
+				BlockChangeRecorder1192::abortBulkChanges
+			);
+		}
 		return ActorContext.pushBulkDeleteBounds(actorName, source, bounds, changeType, actor -> {
 			BuildingIndexStore store = storeSupplier.get();
 			if (store != null) {
@@ -309,9 +332,25 @@ public final class BlockChangeRecorder1192 {
 		});
 	}
 
+	private static boolean stageBulkChanges(ActorContext.Actor actor, List<BulkBlockChange> changes) {
+		BuildingIndexStore store = storeSupplier.get();
+		return store == null || store.stageBulkStateChanges(actor.bulkOperationId(), changes);
+	}
+
+	private static void abortBulkChanges(ActorContext.Actor actor) {
+		BuildingIndexStore store = storeSupplier.get();
+		if (store != null) {
+			store.discardStagedBulkStateChanges(actor.bulkOperationId());
+		}
+	}
+
 	private static void flushBulkChanges(ActorContext.Actor actor) {
 		BuildingIndexStore store = storeSupplier.get();
 		if (store != null) {
+			if (actor.bulkStreamFailed()) {
+				store.discardStagedBulkStateChanges(actor.bulkOperationId());
+				return;
+			}
 			if (actor.isCompleteBoundsPlacement()
 				&& store.tryRecordCompleteBoundsPlacement(
 					actor.bulkBounds(),
@@ -321,8 +360,8 @@ public final class BlockChangeRecorder1192 {
 				)) {
 				return;
 			}
-			store.recordBulkStateChanges(
-				actor.bulkChanges(),
+			store.finishStagedBulkStateChanges(
+				actor.bulkOperationId(),
 				actor.name,
 				actor.source,
 				actor.bulkBounds(),
@@ -334,8 +373,12 @@ public final class BlockChangeRecorder1192 {
 	private static void flushBulkAudit(ActorContext.Actor actor) {
 		BuildingIndexStore store = storeSupplier.get();
 		if (store != null) {
-			store.recordBulkAuditOnly(
-				actor.bulkChanges(),
+			if (actor.bulkStreamFailed()) {
+				store.discardStagedBulkStateChanges(actor.bulkOperationId());
+				return;
+			}
+			store.finishStagedBulkAuditOnly(
+				actor.bulkOperationId(),
 				actor.name,
 				actor.source,
 				actor.bulkBounds(),

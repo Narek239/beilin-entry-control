@@ -90,10 +90,11 @@ public final class BuildingIndexStoreStorageTest {
 					SELECT COUNT(*) FROM region_blocks
 					WHERE first_placed_at LIKE '%T%' OR last_touched_at LIKE '%T%'
 					"""), "placed block datetimes should be normalized");
-			}
-			assertRecordingSemantics(dir);
-			assertHistoryAuditDoesNotWriteOwnership(dir);
-			assertCompleteBoundsPlacement(dir);
+				}
+				assertRecordingSemantics(dir);
+				assertStreamingBulkRecording(dir);
+				assertHistoryAuditDoesNotWriteOwnership(dir);
+				assertCompleteBoundsPlacement(dir);
 			assertStructureAuditSwitch(dir);
 			assertBoundsDeletion(dir);
 			assertNonLinearBoundsDeletion(dir);
@@ -184,6 +185,137 @@ public final class BuildingIndexStoreStorageTest {
 			assertEquals(1, ackStore.listPendingStructureAuditEvents(10).size(), "ack deletion should remove acknowledged audit summaries");
 		} finally {
 			ackStore.close();
+		}
+	}
+
+	private static void assertStreamingBulkRecording(Path dir) throws Exception {
+		Path db = dir.resolve("streaming-bulk.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		int[] batchCalls = {0};
+		int[] maxBatchSize = {0};
+		int[] maxBufferedChanges = {0};
+		try {
+			try (ActorContext.Scope scope = ActorContext.pushStreamingBulkRecord(
+				"Alice",
+				"WORLDEDIT_PASTE",
+				(actor, changes) -> {
+					batchCalls[0] += 1;
+					maxBatchSize[0] = Math.max(maxBatchSize[0], changes.size());
+					return store.stageBulkStateChanges(actor.bulkOperationId(), changes);
+				},
+				actor -> store.finishStagedBulkStateChanges(
+					actor.bulkOperationId(),
+					actor.name,
+					actor.source,
+					actor.bulkBounds(),
+					actor.bulkResultCount()
+				),
+				actor -> store.discardStagedBulkStateChanges(actor.bulkOperationId())
+			)) {
+				for (int i = 0; i < 1_005; i++) {
+					ActorContext.current().addBulkChange(new BulkBlockChange(
+						"minecraft:overworld",
+						i,
+						64,
+						20,
+						"minecraft:air",
+						"minecraft:stone",
+						true,
+						true
+					));
+					maxBufferedChanges[0] = Math.max(maxBufferedChanges[0], ActorContext.current().bulkChanges().size());
+				}
+			}
+			try (ActorContext.Scope scope = ActorContext.pushStreamingBulkRecord(
+				"Bob",
+				"WORLDEDIT_PASTE",
+				(actor, changes) -> store.stageBulkStateChanges(actor.bulkOperationId(), changes),
+				actor -> store.finishStagedBulkStateChanges(
+					actor.bulkOperationId(),
+					actor.name,
+					actor.source,
+					actor.bulkBounds(),
+					actor.bulkResultCount()
+				),
+				actor -> store.discardStagedBulkStateChanges(actor.bulkOperationId())
+			)) {
+				for (int i = 0; i < 1_005; i++) {
+					ActorContext.current().addBulkChange(new BulkBlockChange(
+						"minecraft:overworld",
+						2_000 + i,
+						64,
+						20,
+						"minecraft:air",
+						"minecraft:stone",
+						true,
+						true
+					));
+				}
+				scope.abort();
+			}
+			try (ActorContext.Scope scope = ActorContext.pushStreamingBulkRecord(
+				"Carol",
+				"WORLDEDIT_UNDO",
+				(actor, changes) -> store.stageBulkStateChanges(actor.bulkOperationId(), changes),
+				actor -> store.finishStagedBulkAuditOnly(
+					actor.bulkOperationId(),
+					actor.name,
+					actor.source,
+					actor.bulkBounds(),
+					actor.bulkResultCount()
+				),
+				actor -> store.discardStagedBulkStateChanges(actor.bulkOperationId())
+			)) {
+				ActorContext.current().addBulkChange(new BulkBlockChange(
+					"minecraft:overworld",
+					4_000,
+					64,
+					20,
+					"minecraft:air",
+					"minecraft:stone",
+					true,
+					true
+				));
+				ActorContext.current().addBulkChange(new BulkBlockChange(
+					"minecraft:overworld",
+					4_001,
+					64,
+					20,
+					"minecraft:stone",
+					"minecraft:air",
+					false,
+					true
+				));
+			}
+		} finally {
+			store.close();
+		}
+		assertTrue(batchCalls[0] >= 1, "streaming bulk should flush at least one full batch before scope close");
+		assertEquals(1_000, maxBatchSize[0], "streaming bulk should flush bounded batches");
+		assertTrue(maxBufferedChanges[0] < 1_000, "streaming bulk should not retain the full operation in ActorContext");
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(1_005, scalarInt(s, "SELECT COUNT(*) FROM region_blocks"), "streaming bulk should preserve every staged placement");
+			assertEquals(1_005, scalarInt(s, "SELECT SUM(first_place_count) FROM region_authors WHERE player_name_key = 'alice'"), "streaming bulk should preserve author placement counts");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_authors WHERE player_name_key = 'bob'"), "aborted streaming bulk should not write author ownership");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x >= 2000"), "aborted streaming bulk should discard staged coordinates");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_PASTE'
+				  AND actor_name = 'Alice'
+				  AND changed_block_count = 1005
+				  AND bounds_block_count = 1005
+				"""), "streaming bulk should emit one exact audit summary at finish");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox WHERE actor_name = 'Bob'"), "aborted streaming bulk should not emit audit summaries");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x >= 4000"), "streaming history audit should not write ownership");
+			assertEquals(1, scalarInt(s, """
+				SELECT COUNT(*) FROM structure_audit_outbox
+				WHERE source = 'WORLDEDIT_UNDO'
+				  AND actor_name = 'Carol'
+				  AND change_type = 'mixed'
+				  AND changed_block_count = 2
+				  AND bounds_block_count = 2
+				"""), "streaming history replay should emit audit-only summaries");
 		}
 	}
 
