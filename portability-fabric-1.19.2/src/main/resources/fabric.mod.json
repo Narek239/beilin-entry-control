@@ -22,6 +22,6 @@
     "minecraft": "~1.19.2",
     "java": ">=17",
     "fabric-api": "*",
-    "beilin-entry-control": ">=1.2.4"
+    "beilin-entry-control": ">=1.2.6"
   }
 }
