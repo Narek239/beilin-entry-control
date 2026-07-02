@@ -15,9 +15,12 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class BeilinWsClientShutdownTest {
 	public static void main(String[] args) throws Exception {
+		assertWsDownKicksOnlyOnAcceptingTransition();
+
 		TestConfig config = new TestConfig();
 		OutboundRouteState routeState = new OutboundRouteState();
 		BeilinApiClient apiClient = new BeilinApiClient(config, routeState);
@@ -51,6 +54,49 @@ public final class BeilinWsClientShutdownTest {
 
 		if (apiClient.playerJoinAsync("Alice").get().ok) {
 			throw new AssertionError("api client accepted work after websocket stop");
+		}
+	}
+
+	private static void assertWsDownKicksOnlyOnAcceptingTransition() throws Exception {
+		TestConfig config = new TestConfig();
+		OutboundRouteState routeState = new OutboundRouteState();
+		EntryGateState gateState = new EntryGateState();
+		CountingHooks hooks = new CountingHooks();
+		BeilinWsClient client = new BeilinWsClient(
+			config,
+			hooks,
+			new BeilinApiClient(config, routeState),
+			gateState,
+			new TestLogger(),
+			routeState
+		);
+		try {
+			invoke(client, "onWsDown", new Class<?>[] { boolean.class }, new Object[] { true });
+			if (hooks.kickAllCount.get() != 0) {
+				throw new AssertionError("initial non-accepting ws down should not kick players");
+			}
+
+			gateState.setAcceptingPlayers(true);
+			invoke(client, "onWsDown", new Class<?>[] { boolean.class }, new Object[] { true });
+			if (hooks.kickAllCount.get() != 1) {
+				throw new AssertionError("accepting->down transition should kick players once");
+			}
+			if (gateState.isAcceptingPlayers()) {
+				throw new AssertionError("ws down should close the entry gate");
+			}
+
+			invoke(client, "onWsDown", new Class<?>[] { boolean.class }, new Object[] { true });
+			if (hooks.kickAllCount.get() != 1) {
+				throw new AssertionError("repeated ws down should not kick players again");
+			}
+
+			gateState.setAcceptingPlayers(true);
+			invoke(client, "onWsDown", new Class<?>[] { boolean.class }, new Object[] { false });
+			if (hooks.kickAllCount.get() != 1) {
+				throw new AssertionError("silent ws down should not kick players");
+			}
+		} finally {
+			client.stop();
 		}
 	}
 
@@ -115,6 +161,29 @@ public final class BeilinWsClientShutdownTest {
 
 		@Override
 		public void kickAll(String reason) {
+		}
+
+		@Override
+		public void kickByUsername(String username, String reason) {
+		}
+	}
+
+	private static final class CountingHooks implements PlatformHooks {
+		private final AtomicInteger kickAllCount = new AtomicInteger();
+
+		@Override
+		public void runOnServerThread(Runnable task) {
+			if (task != null) task.run();
+		}
+
+		@Override
+		public List<String> getOnlineUsernames() {
+			return List.of();
+		}
+
+		@Override
+		public void kickAll(String reason) {
+			kickAllCount.incrementAndGet();
 		}
 
 		@Override

@@ -24,13 +24,6 @@ public final class LoginHandler1201 {
 	}
 
 	public static void register() {
-		ServerLoginConnectionEvents.INIT.register((handler, server) -> {
-			if (!server.isDedicatedServer()) return;
-			if (gateState == null || !gateState.isAcceptingPlayers()) {
-				forceDisconnect(handler, EntryGateState.SYNC_MESSAGE);
-			}
-		});
-
 		ServerLoginConnectionEvents.QUERY_START.register((handler, server, sender, synchronizer) -> {
 			if (!server.isDedicatedServer()) return;
 			if (gateState == null || !gateState.isAcceptingPlayers()) {
@@ -159,4 +152,3 @@ public final class LoginHandler1201 {
 		return null;
 	}
 }
-

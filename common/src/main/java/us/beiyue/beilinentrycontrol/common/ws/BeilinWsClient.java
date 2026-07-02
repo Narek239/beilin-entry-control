@@ -476,8 +476,9 @@ public final class BeilinWsClient {
 
 	private void onWsDown(boolean kickPlayers) {
 		if (isStopped()) return;
+		boolean wasAcceptingPlayers = gateState.isAcceptingPlayers();
 		gateState.setAcceptingPlayers(false);
-		if (kickPlayers) {
+		if (kickPlayers && wasAcceptingPlayers) {
 			hooks.runOnServerThread(() -> hooks.kickAll(EntryGateState.SYNC_MESSAGE));
 		}
 	}
