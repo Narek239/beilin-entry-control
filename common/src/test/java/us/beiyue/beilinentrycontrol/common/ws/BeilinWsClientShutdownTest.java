@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public final class BeilinWsClientShutdownTest {
 	public static void main(String[] args) throws Exception {
-		assertWsDownKicksOnlyOnAcceptingTransition();
+		assertLoudWsDownKicksAfterSilentWsDown();
 
 		TestConfig config = new TestConfig();
 		OutboundRouteState routeState = new OutboundRouteState();
@@ -57,7 +57,7 @@ public final class BeilinWsClientShutdownTest {
 		}
 	}
 
-	private static void assertWsDownKicksOnlyOnAcceptingTransition() throws Exception {
+	private static void assertLoudWsDownKicksAfterSilentWsDown() throws Exception {
 		TestConfig config = new TestConfig();
 		OutboundRouteState routeState = new OutboundRouteState();
 		EntryGateState gateState = new EntryGateState();
@@ -71,29 +71,18 @@ public final class BeilinWsClientShutdownTest {
 			routeState
 		);
 		try {
-			invoke(client, "onWsDown", new Class<?>[] { boolean.class }, new Object[] { true });
-			if (hooks.kickAllCount.get() != 0) {
-				throw new AssertionError("initial non-accepting ws down should not kick players");
-			}
-
-			gateState.setAcceptingPlayers(true);
-			invoke(client, "onWsDown", new Class<?>[] { boolean.class }, new Object[] { true });
-			if (hooks.kickAllCount.get() != 1) {
-				throw new AssertionError("accepting->down transition should kick players once");
-			}
-			if (gateState.isAcceptingPlayers()) {
-				throw new AssertionError("ws down should close the entry gate");
-			}
-
-			invoke(client, "onWsDown", new Class<?>[] { boolean.class }, new Object[] { true });
-			if (hooks.kickAllCount.get() != 1) {
-				throw new AssertionError("repeated ws down should not kick players again");
-			}
-
 			gateState.setAcceptingPlayers(true);
 			invoke(client, "onWsDown", new Class<?>[] { boolean.class }, new Object[] { false });
-			if (hooks.kickAllCount.get() != 1) {
+			if (hooks.kickAllCount.get() != 0) {
 				throw new AssertionError("silent ws down should not kick players");
+			}
+			if (gateState.isAcceptingPlayers()) {
+				throw new AssertionError("silent ws down should close the entry gate");
+			}
+
+			invoke(client, "onWsDown", new Class<?>[] { boolean.class }, new Object[] { true });
+			if (hooks.kickAllCount.get() != 1) {
+				throw new AssertionError("loud ws down should kick after silent ws down closed the gate");
 			}
 		} finally {
 			client.stop();
