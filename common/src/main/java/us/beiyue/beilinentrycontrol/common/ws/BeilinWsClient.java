@@ -47,7 +47,7 @@ import us.beiyue.beilinentrycontrol.common.http.OutboundRoute;
 import us.beiyue.beilinentrycontrol.common.http.OutboundRouteState;
 
 /**
- * WebSocket connect/reconnect, 15s JSON ping, 30s pong timeout.
+ * WebSocket connect/reconnect with OkHttp's 15s protocol-level ping/pong heartbeat.
  * PRIMARY uses system DNS; BACKUP resolves {@link CommonConfig#wsBackupDnsHost()} to an IP while
  * TLS SNI / {@code Host} use {@link CommonConfig#baseHost()} (same authority as {@link CommonConfig#wsUri()}).
  * Each successful WS session triggers {@link BeilinApiClient#playerJoinAsync} for all in-world players (auth clears online state on new connections).
@@ -55,7 +55,6 @@ import us.beiyue.beilinentrycontrol.common.http.OutboundRouteState;
 public final class BeilinWsClient {
 	private static final int NORMAL_CLOSURE = 1000;
 	private static final long PING_INTERVAL_SEC = 15;
-	private static final long PONG_TIMEOUT_SEC = 30;
 	private static final long RECONNECT_INITIAL_SEC = 5;
 	private static final long RECONNECT_MAX_SEC = 300;
 	private static final double RECONNECT_BACKOFF_MULTIPLIER = 1.5;
@@ -82,9 +81,11 @@ public final class BeilinWsClient {
 
 	private final OkHttpClient primaryWsClient = new OkHttpClient.Builder()
 		.connectTimeout(Duration.ofSeconds(10))
+		.pingInterval(Duration.ofSeconds(PING_INTERVAL_SEC))
 		.build();
 	private final OkHttpClient backupWsClient = new OkHttpClient.Builder()
 		.connectTimeout(Duration.ofSeconds(10))
+		.pingInterval(Duration.ofSeconds(PING_INTERVAL_SEC))
 		.build();
 
 	private final CommonConfig config;
@@ -99,10 +100,7 @@ public final class BeilinWsClient {
 	private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
 	private final AtomicBoolean stopped = new AtomicBoolean(false);
 
-	private ScheduledFuture<?> pingTask;
-	private ScheduledFuture<?> pongWatchdog;
 	private ScheduledFuture<?> primaryProbeTask;
-	private volatile long lastPongTime;
 	private volatile boolean intentionalClose;
 	private volatile long nextReconnectDelaySec = RECONNECT_INITIAL_SEC;
 	private int connectFailCount = 0;
@@ -168,7 +166,6 @@ public final class BeilinWsClient {
 		stopped.set(true);
 		intentionalClose = true;
 		reconnectScheduled.set(false);
-		cancelTimers();
 		cancelPrimaryProbe();
 		WebSocket w = wsRef.getAndSet(null);
 		if (w != null) {
@@ -239,7 +236,6 @@ public final class BeilinWsClient {
 			} catch (Exception ignored) {
 			}
 		}
-		cancelTimers();
 
 		OutboundRoute route;
 		if (pendingScheduleRoute != null) {
@@ -485,11 +481,9 @@ public final class BeilinWsClient {
 	private void onWsUp(WebSocket ws) {
 		if (isStopped()) return;
 		wsRef.set(ws);
-		lastPongTime = System.currentTimeMillis();
 		nextReconnectDelaySec = RECONNECT_INITIAL_SEC;
 		connectFailCount = 0;
 		gateState.setAcceptingPlayers(true);
-		startHeartbeat(ws);
 		// Auth server clears online players on each new WebSocket; re-register everyone in-world.
 		syncOnlinePlayersAfterWsConnect();
 		requestExportJobs(ws);
@@ -539,34 +533,6 @@ public final class BeilinWsClient {
 		});
 	}
 
-	private void startHeartbeat(WebSocket ws) {
-		cancelTimers();
-		pingTask = scheduleAtFixedRateOnScheduler(() -> {
-			try {
-				if (!ws.send("{\"action\":\"ping\"}")) {
-					log.warn("Beilin WS ping send failed: output queue closed");
-					return;
-				}
-				if (pongWatchdog != null) pongWatchdog.cancel(false);
-				pongWatchdog = scheduleOnScheduler(() -> {
-					if (System.currentTimeMillis() - lastPongTime > PONG_TIMEOUT_SEC * 1000L) {
-						log.warn("Beilin WS pong timeout, aborting");
-						ws.cancel();
-					}
-				}, PONG_TIMEOUT_SEC, TimeUnit.SECONDS);
-			} catch (Exception e) {
-				log.warn("Beilin WS ping send failed: {}", e.toString());
-			}
-		}, PING_INTERVAL_SEC, PING_INTERVAL_SEC, TimeUnit.SECONDS);
-	}
-
-	private void cancelTimers() {
-		if (pingTask != null) pingTask.cancel(false);
-		if (pongWatchdog != null) pongWatchdog.cancel(false);
-		pingTask = null;
-		pongWatchdog = null;
-	}
-
 	private void cancelPrimaryProbe() {
 		if (primaryProbeTask != null) {
 			primaryProbeTask.cancel(false);
@@ -594,7 +560,6 @@ public final class BeilinWsClient {
 				cancelPrimaryProbe();
 				WebSocket w = wsRef.getAndSet(null);
 				if (w != null) {
-					cancelTimers();
 					onWsDown(false);
 					try {
 						w.close(NORMAL_CLOSURE, "switch_to_primary");
@@ -646,10 +611,6 @@ public final class BeilinWsClient {
 			JsonObject o = JsonParser.parseString(text).getAsJsonObject();
 			if (!o.has("action")) return;
 			String action = o.get("action").getAsString();
-			if ("pong".equals(action)) {
-				lastPongTime = System.currentTimeMillis();
-				return;
-			}
 			if ("structure_audit_ack".equals(action)) {
 				List<String> eventIds = parseStringArray(o, "event_ids");
 				if (!eventIds.isEmpty()) {
@@ -770,8 +731,6 @@ public final class BeilinWsClient {
 		if (intentionalClose || !wasActive) {
 			return;
 		}
-		cancelTimers();
-
 		if (statusCode == NORMAL_CLOSURE && "switch_to_primary".equals(reason)) {
 			onWsDown(false);
 			connectImmediateRun();

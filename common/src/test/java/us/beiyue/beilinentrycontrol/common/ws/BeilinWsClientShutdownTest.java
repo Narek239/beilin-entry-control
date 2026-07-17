@@ -1,6 +1,7 @@
 package us.beiyue.beilinentrycontrol.common.ws;
 
 import okhttp3.Response;
+import okhttp3.OkHttpClient;
 import okhttp3.WebSocket;
 import us.beiyue.beilinentrycontrol.common.config.CommonConfig;
 import us.beiyue.beilinentrycontrol.common.gate.EntryGateState;
@@ -12,6 +13,7 @@ import us.beiyue.beilinentrycontrol.common.platform.PlatformHooks;
 
 import java.io.IOException;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -32,6 +34,7 @@ public final class BeilinWsClientShutdownTest {
 			new TestLogger(),
 			routeState
 		);
+		assertProtocolPingConfigured(client);
 
 		client.stop();
 		AtomicBoolean executed = new AtomicBoolean(false);
@@ -54,6 +57,17 @@ public final class BeilinWsClientShutdownTest {
 
 		if (apiClient.playerJoinAsync("Alice").get().ok) {
 			throw new AssertionError("api client accepted work after websocket stop");
+		}
+	}
+
+	private static void assertProtocolPingConfigured(BeilinWsClient client) throws ReflectiveOperationException {
+		for (String fieldName : List.of("primaryWsClient", "backupWsClient")) {
+			Field field = BeilinWsClient.class.getDeclaredField(fieldName);
+			field.setAccessible(true);
+			OkHttpClient okHttp = (OkHttpClient) field.get(client);
+			if (okHttp.pingIntervalMillis() != 15_000) {
+				throw new AssertionError(fieldName + " must use a 15s WebSocket protocol ping interval");
+			}
 		}
 	}
 
