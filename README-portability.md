@@ -147,7 +147,7 @@ Beilin Data Portability 是 Beilin Entry Control 的 Fabric 服务端附属模�
 - 用户名归属与作者比例；
 - 最近触达时间、风险标记和扫描缓存信息。
 
-通过 WorldEdit 或 Effortless Structure 产生结构变更时，模组会以执行玩家作为归属记录。
+通过原版 `/fill`、WorldEdit 或 Effortless Structure 产生结构变更时，模组会以执行玩家作为归属记录。原版 `/fill` 的 `replace`、`keep`、`outline`、`hollow` 与 `destroy` 模式均按实际成功写入的方块更新索引；由控制台或命令方块执行时，则沿用系统方块变更的处理方式，不会虚构玩家归属。
 
 ---
 

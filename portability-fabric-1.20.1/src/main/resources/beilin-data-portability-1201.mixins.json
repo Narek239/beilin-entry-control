@@ -9,6 +9,7 @@
     "LevelSetBlockMixin",
     "ServerGamePacketListenerImplMixin",
     "ServerPlayerGameModeMixin",
+    "VanillaFillCommandMixin",
     "WorldEditClipboardCommandsMixin",
     "WorldEditEditSessionMixin",
     "WorldEditHistoryCommandsMixin",

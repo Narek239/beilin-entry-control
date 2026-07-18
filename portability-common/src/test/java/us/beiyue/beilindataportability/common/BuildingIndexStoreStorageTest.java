@@ -95,6 +95,7 @@ public final class BuildingIndexStoreStorageTest {
 				assertStreamingBulkRecording(dir);
 				assertHistoryAuditDoesNotWriteOwnership(dir);
 				assertCompleteBoundsPlacement(dir);
+			assertVanillaFillSkipsStructureAudit(dir);
 			assertStructureAuditSwitch(dir);
 			assertBoundsDeletion(dir);
 			assertNonLinearBoundsDeletion(dir);
@@ -112,6 +113,49 @@ public final class BuildingIndexStoreStorageTest {
 				store.close();
 			}
 			deleteTree(dir);
+		}
+	}
+
+	private static void assertVanillaFillSkipsStructureAudit(Path dir) throws Exception {
+		Path db = dir.resolve("vanilla-fill-no-audit.db");
+		BuildingIndexStore store = BuildingIndexStore.open(db, new NoopLogger());
+		try {
+			store.recordPlaced("minecraft:overworld", 0, 64, 0, "minecraft:stone", "Alice");
+			String operationId = "vanilla-fill-staged";
+			assertTrue(store.stageBulkStateChanges(operationId, List.of(
+				new BulkBlockChange(
+					"minecraft:overworld",
+					10,
+					64,
+					0,
+					"minecraft:air",
+					"minecraft:oak_planks",
+					true,
+					true
+				)
+			)), "vanilla /fill changes should be staged");
+			store.finishStagedBulkStateChanges(
+				operationId,
+				"Alice",
+				"VANILLA_FILL",
+				new BulkPlacementBounds("minecraft:overworld", 10, 64, 0, 10, 64, 0, 1),
+				1
+			);
+			store.deleteIndexedBlocksInBounds(
+				new BulkPlacementBounds("minecraft:overworld", 0, 64, 0, 0, 64, 0, 1),
+				"Alice",
+				"VANILLA_FILL",
+				"mixed",
+				1
+			);
+		} finally {
+			store.close();
+		}
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+			 Statement s = c.createStatement()) {
+			assertEquals(1, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 10"), "vanilla /fill should still add indexed coordinates");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM region_blocks WHERE x = 0"), "linear vanilla /fill handling should still delete indexed coordinates");
+			assertEquals(0, scalarInt(s, "SELECT COUNT(*) FROM structure_audit_outbox"), "vanilla /fill should not enqueue structure audit events");
 		}
 	}
 

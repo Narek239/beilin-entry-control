@@ -1419,7 +1419,7 @@ public final class BuildingIndexStore {
 	}
 
 	private void insertStructureAuditEvent(StructureAuditEvent event) throws SQLException {
-		if (event == null) return;
+		if (event == null || "VANILLA_FILL".equalsIgnoreCase(event.source)) return;
 		try (PreparedStatement ps = connection.prepareStatement("""
 			INSERT OR IGNORE INTO structure_audit_outbox (
 				event_id, actor_name, tool, operation, source, change_type, dimension,

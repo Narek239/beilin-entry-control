@@ -1,8 +1,11 @@
 package us.beiyue.beilindataportability.platform.fabric1201;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.structure.BoundingBox;
 import org.slf4j.Logger;
 import us.beiyue.beilindataportability.common.ActorContext;
 import us.beiyue.beilindataportability.common.BulkBlockChange;
@@ -78,6 +81,24 @@ public final class BlockChangeRecorder1201 {
 
 	public static void abortBulkScope(ActorContext.Scope scope) {
 		if (scope != null) scope.abort();
+	}
+
+	public static ActorContext.Scope beginVanillaFill(CommandSourceStack source, BoundingBox box) {
+		if (source == null || !(source.getEntity() instanceof ServerPlayer player)) return null;
+		String actorName = player.getGameProfile().getName();
+		BulkPlacementBounds bounds = box != null
+			? new BulkPlacementBounds(
+				source.getLevel().dimension().location().toString(),
+				box.minX(),
+				box.minY(),
+				box.minZ(),
+				box.maxX(),
+				box.maxY(),
+				box.maxZ(),
+				(int) Math.min(Integer.MAX_VALUE, (long) box.getXSpan() * box.getYSpan() * box.getZSpan())
+			)
+			: null;
+		return beginBulkRecordOrDiscardLinear(actorName, "VANILLA_FILL", bounds);
 	}
 
 	public static ActorContext.Scope beginWorldEditSet(Object actor, Object editSession, Object region, Object pattern) {
